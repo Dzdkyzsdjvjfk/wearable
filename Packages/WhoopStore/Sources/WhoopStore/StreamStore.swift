@@ -115,14 +115,15 @@ extension WhoopStore {
         -> (hr: Int, rr: Int, events: Int, battery: Int,
             spo2: Int, skinTemp: Int, resp: Int, gravity: Int) {
         try syncRead { db in
-            (try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM hrSample") ?? 0,
-             try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM rrInterval") ?? 0,
-             try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM event") ?? 0,
-             try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM battery") ?? 0,
-             try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM spo2Sample") ?? 0,
-             try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM skinTempSample") ?? 0,
-             try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM respSample") ?? 0,
-             try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM gravitySample") ?? 0)
+            let hr = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM hrSample") ?? 0
+            let rr = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM rrInterval") ?? 0
+            let events = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM event") ?? 0
+            let battery = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM battery") ?? 0
+            let spo2 = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM spo2Sample") ?? 0
+            let skinTemp = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM skinTempSample") ?? 0
+            let resp = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM respSample") ?? 0
+            let gravity = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM gravitySample") ?? 0
+            return (hr, rr, events, battery, spo2, skinTemp, resp, gravity)
         }
     }
 
