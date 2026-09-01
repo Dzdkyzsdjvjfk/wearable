@@ -1,0 +1,61 @@
+name: Build unsigned OpenWhoop IPA
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths:
+      - "ios/**"
+      - "Packages/**"
+      - ".github/workflows/build-ipa.yml"
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_15.4.app/Contents/Developer || true
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Provide placeholder Secrets.xcconfig
+        run: cp ios/OpenWhoop/Config/Secrets.example.xcconfig ios/OpenWhoop/Config/Secrets.xcconfig
+
+      - name: Generate Xcode project
+        run: |
+          cd ios
+          xcodegen generate
+
+      - name: Build unsigned .app for iOS device
+        run: |
+          cd ios
+          xcodebuild \
+            -project OpenWhoop.xcodeproj \
+            -scheme OpenWhoop \
+            -sdk iphoneos \
+            -configuration Release \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package as .ipa (unsigned)
+        run: |
+          cd ios/build/Build/Products/Release-iphoneos
+          mkdir -p Payload
+          cp -r OpenWhoop.app Payload/
+          zip -r OpenWhoop-unsigned.ipa Payload
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp OpenWhoop-unsigned.ipa "$GITHUB_WORKSPACE/out/"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenWhoop-unsigned-ipa
+          path: out/OpenWhoop-unsigned.ipa
+          retention-days: 14
