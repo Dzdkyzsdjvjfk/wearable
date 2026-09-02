@@ -5,9 +5,12 @@ import WhoopStore
 // MARK: - MetricsRepository
 //
 // View-facing read facade over the local MetricsCache (WhoopStore tables dailyMetric +
-// sleepSession). The phone does NO metric computation: all values are server-computed and
-// cached locally by ServerSync.pullDerived(). MetricsRepository only reads the cache and
-// delegates network refreshes to ServerSync.
+// sleepSession).
+//
+// TWO SOURCES fill that cache:
+//   1. ServerSync.pullDerived() -- server-computed values, when a server is configured.
+//   2. LocalMetricsEngine -- on-device computation from the raw streams the strap offloaded,
+//      used when no server is configured. See MetricsRepository+Local.swift.
 //
 // LAZY-OPEN DESIGN: The synchronous init() does NOT open the on-disk store (WhoopStore.init
 // is async). Instead, ensureOpen() is called at the top of every async method and opens the
@@ -24,9 +27,9 @@ final class MetricsRepository: ObservableObject {
     @Published private(set) var lastRefreshedAt: Date?
 
     // Injected directly (test path): store + sync are ready immediately; skip ensureOpen.
-    private var store: WhoopStore?
-    private var serverSync: ServerSync?
-    private let deviceId: String
+    private(set) var store: WhoopStore?
+    private(set) var serverSync: ServerSync?
+    let deviceId: String
 
     // Lazy-open state (app path).
     private var _alreadyOpen = false
@@ -63,7 +66,7 @@ final class MetricsRepository: ObservableObject {
     /// Concurrency contract: all callers on @MainActor await the SAME Task so no second caller
     /// can observe store == nil after ensureOpen() returns. The guard+assign block has no await
     /// between check and assign, so it is atomic on the single MainActor executor.
-    private func ensureOpen() async {
+    func ensureOpen() async {
         // Test path (store injected) or a previously-completed open: nothing to do.
         if _alreadyOpen, store != nil { return }
         // An open is already in flight — await the SAME task so we don't double-open.
@@ -137,6 +140,7 @@ final class MetricsRepository: ObservableObject {
         isRefreshing = true
         lastError = nil
         await serverSync?.pullDerived()
+        await computeLocalMetrics()
         await load()
         isRefreshing = false
         lastRefreshedAt = Date()

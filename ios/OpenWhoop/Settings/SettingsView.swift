@@ -139,6 +139,7 @@ struct SettingsView: View {
                 ageSection
                 sexSection
                 saveSection
+                diagnosticsSection
                 footerSection
             }
             .scrollContentBackground(.hidden)
