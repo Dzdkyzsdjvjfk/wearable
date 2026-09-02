@@ -377,6 +377,17 @@ public final class BLEManager: NSObject, ObservableObject {
                                               ourFrontierTs: front,
                                               now: now)
             state.strapNeedsReboot = stuck
+            // Always log the actual numbers behind the watchdog's verdict — not just when it
+            // fires. Without this there's no way to tell "genuinely behind by 40 minutes" apart
+            // from "behind by 4 seconds, healthy, don't worry about it" from the log alone.
+            if let strapNewest, let front {
+                let gapMin = Double(strapNewest - front) / 60.0
+                log(String(format: "Liveness check: strap newest=%d, our frontier=%d, gap=%.1f min, stuck=%@",
+                           strapNewest, front, gapMin, stuck ? "YES" : "no"))
+            } else {
+                log("Liveness check: strapNewest=\(strapNewest.map(String.init) ?? "nil"), " +
+                    "frontier=\(front.map(String.init) ?? "nil") — can't compute gap yet")
+            }
             if stuck {
                 log("Watchdog: behind + frontier frozen — recovery (exit high-freq + SET_CLOCK)")
                 send(.exitHighFreqSync, payload: [0x00])

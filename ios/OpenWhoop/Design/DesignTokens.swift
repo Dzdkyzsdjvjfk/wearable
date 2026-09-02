@@ -96,14 +96,39 @@ enum WH {
             .system(size: size, weight: .semibold, design: .rounded)
         }
 
-        /// Card title / section header
-        static let cardTitle: SwiftUI.Font = .system(size: 11, weight: .semibold, design: .default)
+        /// Card title / section header. Uses a semantic text style (not a fixed point size) so it
+        /// scales with the user's Dynamic Type / accessibility text-size setting.
+        static let cardTitle: SwiftUI.Font = .system(.caption2, design: .default).weight(.semibold)
 
-        /// Unit label next to a big number
-        static let unit: SwiftUI.Font = .system(size: 15, weight: .medium, design: .rounded)
+        /// Unit label next to a big number. Scales with Dynamic Type.
+        static let unit: SwiftUI.Font = .system(.subheadline, design: .rounded).weight(.medium)
 
-        /// Caption / secondary label
-        static let caption: SwiftUI.Font = .system(size: 12, weight: .regular, design: .default)
+        /// Caption / secondary label. Scales with Dynamic Type.
+        static let caption: SwiftUI.Font = .system(.caption, design: .default)
+
+        // MARK: - Dynamic Type scaling for fixed-size numerals
+        //
+        // metricHero/metricLarge/metricMedium above take a raw point size, so on their own they
+        // do NOT grow with Dynamic Type — the hero numbers live inside fixed-diameter rings and
+        // fixed-width cards, which can't reflow the way running text can. `numeralScale(for:)`
+        // gives those call sites (PercentRing, MetricCard) a bounded multiplier: it grows the
+        // numeral for accessibility text sizes without blowing up the surrounding layout.
+
+        /// Bounded growth multiplier for hero/value numerals at a given Dynamic Type size.
+        static func numeralScale(for dynamicTypeSize: DynamicTypeSize) -> CGFloat {
+            switch dynamicTypeSize {
+            case .xSmall, .small, .medium, .large: return 1.0
+            case .xLarge:          return 1.08
+            case .xxLarge:         return 1.15
+            case .xxxLarge:        return 1.22
+            case .accessibility1:  return 1.3
+            case .accessibility2:  return 1.4
+            case .accessibility3:  return 1.5
+            case .accessibility4:  return 1.6
+            case .accessibility5:  return 1.7
+            @unknown default:      return 1.0
+            }
+        }
     }
 }
 

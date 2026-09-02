@@ -13,6 +13,9 @@ struct MetricCard<Accessory: View>: View {
     var accentColor: Color = WH.Color.textPrimary
     var accessory: (() -> Accessory)?
 
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    private var valueSize: CGFloat { 28 * WH.Font.numeralScale(for: dynamicTypeSize) }
+
     var body: some View {
         VStack(alignment: .leading, spacing: WH.Spacing.sm) {
 
@@ -28,7 +31,7 @@ struct MetricCard<Accessory: View>: View {
             // --- Value + unit ---
             HStack(alignment: .lastTextBaseline, spacing: 4) {
                 Text(value)
-                    .font(WH.Font.metricMedium())
+                    .font(WH.Font.metricMedium(size: valueSize))
                     .foregroundStyle(accentColor)
                     .monospacedDigit()
 
@@ -48,6 +51,11 @@ struct MetricCard<Accessory: View>: View {
         }
         .padding(WH.Spacing.md)
         .background(WH.Color.surface, in: RoundedRectangle(cornerRadius: WH.Radius.card, style: .continuous))
+        // Default combined VoiceOver reading ("HRV, 62 ms") for every call site. A caller that
+        // wants a more specific phrase (e.g. including a live status) can still override with its
+        // own .accessibilityLabel(...) on top of this view — an explicit label always wins.
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(title)\(unit.map { ", \(value) \($0)" } ?? ", \(value)")")
     }
 }
 

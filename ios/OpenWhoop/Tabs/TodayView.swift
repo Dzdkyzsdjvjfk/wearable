@@ -1,13 +1,31 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 // MARK: - TodayView
-// The command-centre "Today" tab. Renders server-cached recovery/strain/sleep/HRV/RHR
-// metrics pulled from MetricsRepository.
-// Tapping any metric card → MetricDetailView (full history, range selector).
+// The command-centre "Today" tab. Renders server-cached recovery/strain/sleep/HRV/RHR metrics
+// pulled from MetricsRepository, plus live BLE readings (HR chart, Stress) from LiveViewModel.
+//
+// Layout: three percentage hero rings (Sleep / Recovery / Strain) → detailed sleep card →
+// a user-reorderable row of tiles (HRV / Resting HR / Stress) → a live heart-rate chart →
+// strap status + sync footer.
+//
+// Tapping a metric → MetricDetailView (full history, range selector). The Stress tile has no
+// history (it's live-only by design) — tapping it opens an explainer sheet instead.
 
 struct TodayView: View {
     @EnvironmentObject private var metrics: MetricsRepository
     @EnvironmentObject private var live: LiveViewModel
+    @EnvironmentObject private var journal: JournalStore
+
+    // Reorderable HRV / RHR / Stress row
+    @State private var tileOrder: [TodayTileKind] = TileOrderStore.load()
+    @State private var draggedTile: TodayTileKind?
+
+    // Live HR chart selection (tap-to-highlight, like the Trends HR card)
+    @State private var hrChartSelected: TrendPoint?
+
+    @State private var showStressExplainer = false
+    @State private var showJournal = false
 
     var body: some View {
         NavigationStack {
@@ -29,6 +47,12 @@ struct TodayView: View {
         .preferredColorScheme(.dark)
         .task { await metrics.refresh() }
         .refreshable { await metrics.refresh() }
+        .sheet(isPresented: $showStressExplainer) {
+            StressExplainerView()
+        }
+        .sheet(isPresented: $showJournal) {
+            JournalEntryView(day: JournalStore.dayString(), dayLabel: "Today", journal: journal)
+        }
     }
 
     // MARK: - Loading
@@ -53,14 +77,8 @@ struct TodayView: View {
                 // Custom tight header (replaces the hidden system large-title nav bar)
                 ScreenHeader("Today")
 
-                // Hero recovery ring (tappable → recovery history)
-                heroSection
-
-                // Strain card → strain history
-                NavigationLink(destination: MetricDetailView(kind: .strain)) {
-                    strainCard
-                }
-                .buttonStyle(.plain)
+                // Three hero rings: Sleep / Recovery / Strain, each as a percentage
+                heroRingsRow
 
                 // Sleep card → sleep duration history
                 NavigationLink(destination: MetricDetailView(kind: .sleepDuration)) {
@@ -68,8 +86,14 @@ struct TodayView: View {
                 }
                 .buttonStyle(.plain)
 
-                // HRV + RHR cards (half width each)
-                hrvAndRhrRow
+                // HRV + Resting HR + Stress — user can drag to reorder; order is persisted
+                reorderableTileRow
+
+                // Daily journal (custom tags + note) — local-only, no backend
+                journalCard
+
+                // Live heart-rate chart (BLE stream, not server-backed — updates in real time)
+                hrChartCard
 
                 if let err = metrics.lastError {
                     errorBanner(err)
@@ -89,61 +113,76 @@ struct TodayView: View {
         .background(WH.Color.background)
     }
 
-    // MARK: - Hero section (recovery ring → recovery history)
+    // MARK: - Hero rings (Sleep / Recovery / Strain, all as percentages)
 
-    private var heroSection: some View {
-        HStack {
-            Spacer()
-            NavigationLink(destination: MetricDetailView(kind: .recovery)) {
-                if let recovery = metrics.today?.recovery {
-                    RecoveryRing(percent: recovery * 100, size: 200, strokeWidth: 16)
-                } else {
-                    pendingRecoveryRing
-                }
-            }
-            .buttonStyle(.plain)
-            Spacer()
+    private var heroRingsRow: some View {
+        HStack(spacing: WH.Spacing.md) {
+            ringSlot(value: sleepPercent,
+                     color: WH.Color.sleepPurple,
+                     label: "SLEEP",
+                     destination: .sleepDuration,
+                     accessibilityDetail: "sleep efficiency")
+
+            ringSlot(value: recoveryPercent,
+                     color: recoveryPercent.map(WH.Color.recoveryColor(forPercent:)) ?? WH.Color.textSecondary,
+                     label: "RECOVERY",
+                     destination: .recovery)
+
+            ringSlot(value: strainPercent,
+                     color: WH.Color.strainBlue,
+                     label: "STRAIN",
+                     destination: .strain,
+                     caption: strainCaption,
+                     accessibilityDetail: strainCaption.map { "\($0) day strain" })
         }
         .padding(.top, WH.Spacing.sm)
     }
 
-    private var pendingRecoveryRing: some View {
-        ZStack {
-            Circle()
-                .stroke(WH.Color.ringTrack, lineWidth: 16)
-            Circle()
-                .stroke(WH.Color.ringTrack.opacity(0.5), lineWidth: 24)
-                .blur(radius: 6)
-
-            VStack(spacing: WH.Spacing.xs) {
-                Text("—")
-                    .font(WH.Font.metricHero(size: 64))
-                    .foregroundStyle(WH.Color.textSecondary)
-                    .monospacedDigit()
-                Text("RECOVERY")
-                    .font(WH.Font.cardTitle)
-                    .foregroundStyle(WH.Color.textSecondary)
-                    .tracking(1.5)
-                Text("Pending")
-                    .font(WH.Font.caption)
-                    .foregroundStyle(WH.Color.textSecondary.opacity(0.7))
-            }
-        }
-        .frame(width: 200, height: 200)
+    /// Sleep efficiency as a percent — the one sleep number that's a percentage natively.
+    private var sleepPercent: Double? {
+        if let e = metrics.today?.efficiency, e > 0 { return e * 100 }
+        if let e = metrics.lastNight?.efficiency, e > 0 { return e * 100 }
+        return nil
     }
 
-    // MARK: - Strain card
+    private var recoveryPercent: Double? {
+        metrics.today?.recovery.map { $0 * 100 }
+    }
 
-    private var strainCard: some View {
-        let value: String = {
-            guard let s = metrics.today?.strain else { return "—" }
-            return String(format: "%.1f", s)
-        }()
-        let hasStrain = metrics.today?.strain != nil
-        return MetricCard(title: "Day Strain",
-                          value: value,
-                          unit: hasStrain ? "/ 21" : nil,
-                          accentColor: hasStrain ? WH.Color.strainBlue : WH.Color.textSecondary)
+    /// Strain isn't naturally a percentage — WHOOP's own scale is 0–21, not linear/perceptual —
+    /// so this ring is `strain / 21 * 100` purely so it visually matches the other two rings, as
+    /// requested. The real 0–21 value is shown as a caption under the ring so it isn't lost.
+    private var strainPercent: Double? {
+        metrics.today?.strain.map { min(100, max(0, ($0 / 21) * 100)) }
+    }
+
+    private var strainCaption: String? {
+        guard let s = metrics.today?.strain else { return nil }
+        return String(format: "%.1f / 21", s)
+    }
+
+    @ViewBuilder
+    private func ringSlot(value: Double?, color: Color, label: String,
+                           destination: MetricKind, caption: String? = nil,
+                           accessibilityDetail: String? = nil) -> some View {
+        VStack(spacing: WH.Spacing.xs) {
+            NavigationLink(destination: MetricDetailView(kind: destination)) {
+                if let value {
+                    PercentRing(value: value, size: 104, strokeWidth: 10, color: color, label: label,
+                                accessibilityDetail: accessibilityDetail)
+                } else {
+                    PendingPercentRing(size: 104, strokeWidth: 10, label: label)
+                }
+            }
+            .buttonStyle(.plain)
+
+            if let caption {
+                Text(caption)
+                    .font(WH.Font.caption)
+                    .foregroundStyle(WH.Color.textSecondary)
+            }
+        }
+        .frame(maxWidth: .infinity)
     }
 
     // MARK: - Sleep card
@@ -200,30 +239,77 @@ struct TodayView: View {
                     in: RoundedRectangle(cornerRadius: WH.Radius.card, style: .continuous))
     }
 
-    // MARK: - HRV + RHR row
+    // MARK: - Reorderable HRV / RHR / Stress row
 
-    private var hrvAndRhrRow: some View {
+    private var reorderableTileRow: some View {
         HStack(spacing: WH.Spacing.sm) {
-            NavigationLink(destination: MetricDetailView(kind: .hrv)) {
-                hrvCard.frame(maxWidth: .infinity)
+            ForEach(tileOrder, id: \.self) { kind in
+                tile(for: kind)
+                    .frame(maxWidth: .infinity)
+                    .onDrag {
+                        draggedTile = kind
+                        return NSItemProvider(object: kind.rawValue as NSString)
+                    }
+                    .onDrop(of: [.plainText],
+                            delegate: TileDropDelegate(item: kind,
+                                                        order: $tileOrder,
+                                                        draggedItem: $draggedTile))
+                    // Drag-and-drop is hard/impossible to use with VoiceOver, so every tile also
+                    // exposes "Move left/right" as VoiceOver custom actions — a real alternative,
+                    // not just a fallback in name.
+                    .accessibilityAction(named: Text("Move left")) { moveTile(kind, by: -1) }
+                    .accessibilityAction(named: Text("Move right")) { moveTile(kind, by: 1) }
             }
-            .buttonStyle(.plain)
-
-            NavigationLink(destination: MetricDetailView(kind: .rhr)) {
-                rhrCard.frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.plain)
         }
+        // Persist whenever the order settles (drag completes, VoiceOver move, or app relaunches
+        // with a new drop).
+        .onChange(of: tileOrder) { newOrder in
+            TileOrderStore.save(newOrder)
+        }
+    }
+
+    private func moveTile(_ kind: TodayTileKind, by offset: Int) {
+        guard let index = tileOrder.firstIndex(of: kind) else { return }
+        let newIndex = index + offset
+        guard tileOrder.indices.contains(newIndex) else { return }
+        tileOrder.swapAt(index, newIndex)
+    }
+
+    @ViewBuilder
+    private func tile(for kind: TodayTileKind) -> some View {
+        switch kind {
+        case .hrv:
+            NavigationLink(destination: MetricDetailView(kind: .hrv)) { hrvCard }
+                .buttonStyle(.plain)
+        case .rhr:
+            NavigationLink(destination: MetricDetailView(kind: .rhr)) { rhrCard }
+                .buttonStyle(.plain)
+        case .stress:
+            Button { showStressExplainer = true } label: { stressCard }
+                .buttonStyle(.plain)
+                // Overrides MetricCard's own default label so the band (Calm/Elevated/High) is
+                // spoken too, not just the raw index number.
+                .accessibilityLabel(stressAccessibilityLabel)
+        }
+    }
+
+    private var stressAccessibilityLabel: String {
+        guard let idx = live.stressIndex else { return "Stress, not available. Connect your strap to see a live reading." }
+        let band = BaevskyStress.band(for: idx)
+        return "Stress, \(band.label), index \(Int(idx.rounded())). Double tap for more information."
     }
 
     private var hrvCard: some View {
         let hrv = metrics.today?.avgHrv ?? metrics.lastNight?.avgHrv
         let value = hrv.map { String(format: "%.0f", $0) } ?? "—"
-        let accent: Color = hrv != nil ? WH.Color.recoveryGreen : WH.Color.textSecondary
+        // Fixed: was WH.Color.recoveryGreen, which collides visually with the recovery ring.
+        // MetricKind.hrv.color (teal) is the single source of truth for HRV's accent elsewhere.
+        let accent: Color = hrv != nil ? MetricKind.hrv.color : WH.Color.textSecondary
         return MetricCard(title: "HRV",
                           value: value,
                           unit: hrv != nil ? "ms" : nil,
-                          accentColor: accent)
+                          accentColor: accent,
+                          accessory: { tileAccessory() })
     }
 
     private var rhrCard: some View {
@@ -233,7 +319,182 @@ struct TodayView: View {
         return MetricCard(title: "Resting HR",
                           value: value,
                           unit: rhr != nil ? "bpm" : nil,
-                          accentColor: accent)
+                          accentColor: accent,
+                          accessory: { tileAccessory() })
+    }
+
+    private var stressCard: some View {
+        let idx = live.stressIndex
+        let band = idx.map(BaevskyStress.band(for:))
+        let value = idx.map { String(format: "%.0f", $0) } ?? "—"
+        let accent: Color = {
+            switch band {
+            case .calm:     return WH.Color.recoveryGreen
+            case .elevated: return WH.Color.recoveryYellow
+            case .high:     return WH.Color.recoveryRed
+            case nil:       return WH.Color.textSecondary
+            }
+        }()
+        return MetricCard(title: "Stress",
+                          value: value,
+                          unit: nil,
+                          accentColor: accent,
+                          accessory: { tileAccessory(caption: band?.label.uppercased()) })
+    }
+
+    /// Shared accessory row for the three reorderable tiles: an optional short caption on the
+    /// left (used by Stress for its Calm/Elevated/High band) and a drag-handle glyph on the
+    /// right, signalling the tile can be dragged to reorder.
+    private func tileAccessory(caption: String? = nil) -> some View {
+        HStack {
+            if let caption {
+                Text(caption)
+                    .font(.system(size: 10, weight: .semibold, design: .rounded))
+                    .foregroundStyle(WH.Color.textSecondary)
+                    .tracking(0.5)
+            }
+            Spacer()
+            Image(systemName: "line.3.horizontal")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(WH.Color.textSecondary.opacity(0.35))
+                // Purely decorative — the actual reorder affordance for VoiceOver is the
+                // "Move left/right" accessibility actions on the tile itself, not this glyph.
+                .accessibilityHidden(true)
+        }
+    }
+
+    // MARK: - Journal card
+
+    /// Today's journal at a glance: shows what's already logged, or a "Log today" prompt.
+    /// Tapping opens JournalEntryView for today; "History" pushes the full log.
+    private var journalCard: some View {
+        let today = JournalStore.dayString()
+        let entry = journal.entry(for: today)
+        let tagNames = entry.tagIDs.compactMap { id in journal.tags.first { $0.id == id }?.name }
+        let noteText = entry.note.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasLog = !tagNames.isEmpty || !noteText.isEmpty
+
+        return VStack(alignment: .leading, spacing: WH.Spacing.sm) {
+            HStack {
+                Text("JOURNAL")
+                    .font(WH.Font.cardTitle)
+                    .foregroundStyle(WH.Color.textSecondary)
+                    .tracking(1.2)
+                Spacer()
+                NavigationLink(destination: JournalHistoryView()) {
+                    Text("History")
+                        .font(WH.Font.caption)
+                        .foregroundStyle(WH.Color.teal)
+                }
+            }
+
+            Button {
+                showJournal = true
+            } label: {
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        if hasLog {
+                            Text(tagNames.isEmpty ? "Logged" : tagNames.joined(separator: " · "))
+                                .font(WH.Font.metricMedium(size: 17))
+                                .foregroundStyle(WH.Color.textPrimary)
+                                .lineLimit(1)
+                            if !noteText.isEmpty {
+                                Text(noteText)
+                                    .font(WH.Font.caption)
+                                    .foregroundStyle(WH.Color.textSecondary)
+                                    .lineLimit(1)
+                            }
+                        } else {
+                            Text("Log today")
+                                .font(WH.Font.metricMedium(size: 17))
+                                .foregroundStyle(WH.Color.textSecondary)
+                        }
+                    }
+                    Spacer()
+                    Image(systemName: hasLog ? "pencil.circle.fill" : "plus.circle.fill")
+                        .font(.system(size: 22))
+                        .foregroundStyle(WH.Color.teal)
+                        .accessibilityHidden(true)
+                }
+            }
+            .buttonStyle(.plain)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(hasLog
+                ? "Journal logged for today: \(tagNames.joined(separator: ", "))"
+                : "Log today's journal")
+            .accessibilityAddTraits(.isButton)
+        }
+        .padding(WH.Spacing.md)
+        .background(WH.Color.surface,
+                    in: RoundedRectangle(cornerRadius: WH.Radius.card, style: .continuous))
+    }
+
+    // MARK: - Live heart-rate chart
+
+    private var hrChartCard: some View {
+        VStack(alignment: .leading, spacing: WH.Spacing.sm) {
+            HStack(alignment: .lastTextBaseline) {
+                Text("HEART RATE")
+                    .font(WH.Font.cardTitle)
+                    .foregroundStyle(WH.Color.textSecondary)
+                    .tracking(1.2)
+                Spacer()
+                if live.state.connected, let hr = live.state.heartRate {
+                    HStack(alignment: .lastTextBaseline, spacing: 3) {
+                        Text("\(hr)")
+                            .font(WH.Font.metricMedium(size: 22))
+                            .foregroundStyle(MetricKind.rawHR.color)
+                            .monospacedDigit()
+                        Text("bpm")
+                            .font(WH.Font.caption)
+                            .foregroundStyle(WH.Color.textSecondary)
+                    }
+                }
+            }
+            // Labelled on just the header, not the whole card: Swift Charts already gives the
+            // Chart below its own per-point VoiceOver navigation (swipe through samples) —
+            // combining the whole card into one element would silently swallow that.
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(hrChartAccessibilityLabel)
+
+            if live.hrHistory.count >= 2 {
+                MetricChart(series: live.hrHistory,
+                           kind: .rawHR,
+                           showAxes: true,
+                           showSelection: true,
+                           yDomain: nil,
+                           selected: $hrChartSelected)
+                    .frame(height: 140)
+
+                Text("Live · last \(Int(live.hrHistoryWindowMinutes)) min")
+                    .font(WH.Font.caption)
+                    .foregroundStyle(WH.Color.textSecondary.opacity(0.6))
+            } else {
+                HStack {
+                    Spacer()
+                    VStack(spacing: WH.Spacing.xs) {
+                        Image(systemName: "waveform.path.ecg")
+                            .font(.system(size: 22, weight: .light))
+                            .foregroundStyle(WH.Color.textSecondary.opacity(0.5))
+                        Text("Connect your strap (Device tab) to see a live chart")
+                            .font(WH.Font.caption)
+                            .foregroundStyle(WH.Color.textSecondary)
+                            .multilineTextAlignment(.center)
+                    }
+                    Spacer()
+                }
+                .frame(height: 140)
+            }
+        }
+        .padding(WH.Spacing.md)
+        .background(WH.Color.surface,
+                    in: RoundedRectangle(cornerRadius: WH.Radius.card, style: .continuous))
+    }
+
+    private var hrChartAccessibilityLabel: String {
+        guard live.hrHistory.count >= 2 else { return "Heart rate chart, no live data yet" }
+        let latest = Int(live.hrHistory.last?.value.rounded() ?? 0)
+        return "Heart rate chart, latest \(latest) beats per minute, live over the last \(Int(live.hrHistoryWindowMinutes)) minutes"
     }
 
     // MARK: - Empty state
@@ -324,9 +585,12 @@ struct TodayView: View {
                         .foregroundStyle(WH.Color.textSecondary)
                 }
             } else if let at = metrics.lastRefreshedAt {
-                Text("Updated \(relativeTime(from: at))")
+                Text("Last updated \(absoluteTime(from: at))")
                     .font(WH.Font.caption)
                     .foregroundStyle(WH.Color.textSecondary)
+                    // VoiceOver still gets the relative form ("5 minutes ago") — much easier to
+                    // parse by ear than reading a clock time back out loud.
+                    .accessibilityLabel("Last updated \(relativeTime(from: at))")
             }
             Spacer()
         }
@@ -374,6 +638,90 @@ struct TodayView: View {
             return "\(h)h ago"
         }
     }
+
+    /// Clock time, e.g. "14:32" or "9:05 AM" — whichever the device's 12h/24h setting uses.
+    /// "Yesterday 14:32" (or a short date beyond that) when the refresh wasn't today, so the
+    /// footer never shows a bare time that's actually a day (or more) stale.
+    private func absoluteTime(from date: Date) -> String {
+        let fmt = DateFormatter()
+        fmt.timeStyle = .short
+        fmt.dateStyle = .none
+        let time = fmt.string(from: date)
+
+        let cal = Calendar.current
+        if cal.isDateInToday(date) {
+            return time
+        } else if cal.isDateInYesterday(date) {
+            return "yesterday \(time)"
+        } else {
+            let dateFmt = DateFormatter()
+            dateFmt.dateStyle = .short
+            dateFmt.timeStyle = .none
+            return "\(dateFmt.string(from: date)) \(time)"
+        }
+    }
+}
+
+// MARK: - TodayTileKind
+// The three reorderable tiles below the sleep card. Raw values are persisted to UserDefaults —
+// don't rename existing cases without adding a migration, or a user's saved order will look
+// stale/corrupt and silently reset to default (see TileOrderStore.load()).
+enum TodayTileKind: String, CaseIterable, Hashable {
+    case hrv, rhr, stress
+}
+
+// MARK: - TileOrderStore
+// Persists the user's drag-to-reorder tile order via UserDefaults, as a comma-joined raw-value
+// string (there's no native @AppStorage support for a custom array type).
+
+private enum TileOrderStore {
+    private static let key = "today.tileOrder.v1"
+
+    static func load() -> [TodayTileKind] {
+        let defaultOrder = TodayTileKind.allCases
+        let saved = UserDefaults.standard.string(forKey: key)?
+            .split(separator: ",")
+            .compactMap { TodayTileKind(rawValue: String($0)) } ?? []
+
+        // Validate: the saved order must contain exactly the current case set. Guards against a
+        // stale/corrupt save (e.g. from an older app version with a different case list).
+        guard saved.count == defaultOrder.count, Set(saved) == Set(defaultOrder) else {
+            return defaultOrder
+        }
+        return saved
+    }
+
+    static func save(_ order: [TodayTileKind]) {
+        UserDefaults.standard.set(order.map(\.rawValue).joined(separator: ","), forKey: key)
+    }
+}
+
+// MARK: - TileDropDelegate
+// Drives `items.move(fromOffsets:toOffset:)` as the user drags one tile over another.
+// Persisting happens in TodayView's `.onChange(of: tileOrder)`, not here.
+
+private struct TileDropDelegate: DropDelegate {
+    let item: TodayTileKind
+    @Binding var order: [TodayTileKind]
+    @Binding var draggedItem: TodayTileKind?
+
+    func dropEntered(info: DropInfo) {
+        guard let dragged = draggedItem, dragged != item,
+              let from = order.firstIndex(of: dragged),
+              let to = order.firstIndex(of: item) else { return }
+        guard order[to] != dragged else { return }
+        order.move(fromOffsets: IndexSet(integer: from),
+                   toOffset: to > from ? to + 1 : to)
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        DropProposal(operation: .move)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        draggedItem = nil
+        return true
+    }
 }
 
 // MARK: - Preview
@@ -381,6 +729,7 @@ struct TodayView: View {
 #Preview("Today — empty (cold start)") {
     TodayView()
         .environmentObject(MetricsRepository(deviceId: "preview"))
+        .environmentObject(JournalStore())
 }
 
 #Preview("Today — design gallery reference") {

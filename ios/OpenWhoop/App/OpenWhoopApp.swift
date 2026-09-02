@@ -22,10 +22,14 @@ struct OpenWhoopApp: App {
 private struct AppRoot: View {
     @StateObject private var metrics = MetricsRepository(deviceId: AppConfig.deviceId)
     @StateObject private var live    = LiveViewModel(deviceId: AppConfig.deviceId)
+    // Local-only journal (tags + notes per day) — see JournalStore.swift. No async open needed
+    // (UserDefaults-backed), so it can be created synchronously here like the other two.
+    @StateObject private var journal = JournalStore()
 
     var body: some View {
         RootTabView()
             .environmentObject(metrics)
             .environmentObject(live)
+            .environmentObject(journal)
     }
 }

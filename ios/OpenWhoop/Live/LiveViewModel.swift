@@ -13,6 +13,26 @@ public final class LiveViewModel: ObservableObject {
     /// One-line storage summary for the UI; refreshed periodically from LiveView.
     @Published public var storageSummary: String = "stored: —"
 
+    // MARK: - Live Stress (Baevsky Stress Index — see StressMonitor.swift)
+
+    /// Most recent live Stress Index, or nil until enough R-R data has accumulated since connecting.
+    /// Published directly on LiveViewModel (rather than a nested ObservableObject) so views that
+    /// hold `@EnvironmentObject var live: LiveViewModel` observe it reactively — a nested
+    /// ObservableObject stored as a plain property would NOT forward change notifications.
+    @Published public private(set) var stressIndex: Double?
+    private var stressBuffer: [Int] = []
+    /// ~4-5 min of beats at a typical resting HR — long enough for a stable Mo/AMo estimate,
+    /// short enough that the number reflects "right now", not the whole session.
+    private let stressBufferMax = 240
+
+    // MARK: - Live heart-rate history (for the Today-screen live HR chart)
+
+    /// Rolling buffer of recent live HR readings, windowed to `hrHistoryWindowMinutes`.
+    /// Published directly on LiveViewModel for the same reactivity reason as `stressIndex`.
+    @Published private(set) var hrHistory: [TrendPoint] = []
+    public let hrHistoryWindowMinutes: Double = 15
+    private let hrHistoryMaxPoints = 900   // safety cap regardless of the time window
+
     public init(deviceId: String = "my-whoop") {
         let s = LiveState()
         self.state = s
@@ -28,6 +48,48 @@ public final class LiveViewModel: ObservableObject {
             .compactMap { $0 }
             .sink { _ in SyncNudge.reschedule() }
             .store(in: &cancellables)
+
+        // Stress: LiveState.rr is a full replacement snapshot on every BLE update (not an
+        // append), so we accumulate it into our own rolling buffer here.
+        s.$rr
+            .sink { [weak self] rr in self?.ingestRR(rr) }
+            .store(in: &cancellables)
+        // Stress + the live HR chart are live-only readings — clear both on disconnect rather
+        // than showing a stale number or a "Live" chart that's no longer receiving anything.
+        s.$connected
+            .sink { [weak self] connected in
+                guard let self, !connected else { return }
+                self.stressBuffer.removeAll()
+                self.stressIndex = nil
+                self.hrHistory.removeAll()
+            }
+            .store(in: &cancellables)
+
+        // Live HR chart: append every reading, trimmed to the rolling time window.
+        s.$heartRate
+            .compactMap { $0 }
+            .sink { [weak self] hr in self?.recordHR(hr) }
+            .store(in: &cancellables)
+    }
+
+    private func ingestRR(_ rr: [Int]) {
+        guard !rr.isEmpty else { return }
+        stressBuffer.append(contentsOf: rr)
+        if stressBuffer.count > stressBufferMax {
+            stressBuffer.removeFirst(stressBuffer.count - stressBufferMax)
+        }
+        stressIndex = BaevskyStress.index(rrMs: stressBuffer)
+    }
+
+    private func recordHR(_ hr: Int) {
+        let now = Date()
+        hrHistory.append(TrendPoint(id: "\(now.timeIntervalSince1970)", date: now, value: Double(hr)))
+
+        let cutoff = now.addingTimeInterval(-hrHistoryWindowMinutes * 60)
+        hrHistory.removeAll { $0.date < cutoff }
+        if hrHistory.count > hrHistoryMaxPoints {
+            hrHistory.removeFirst(hrHistory.count - hrHistoryMaxPoints)
+        }
     }
 
     public func connect()  { ble.connect() }
