@@ -219,6 +219,55 @@ final class CollectorTests: XCTestCase {
         await c.flush()
         XCTAssertEqual(spy.rawEnqueueCount, 1, "window closed → no further raw enqueue")
     }
+
+    // MARK: - Standard BLE Heart Rate (0x2A37) live path
+
+    func testStandardHRPersistsWithoutClockRef() async throws {
+        let store = try await makeStore()
+        let c = Collector(store: store, deviceId: "my-whoop",
+                          policy: .init(maxFrames: 100, maxInterval: 3600))
+        // No clockRef at all -- this path must not depend on it (2A37 needs no correlation).
+        c.ingestStandardHR(bpm: 61, rrMs: [800])
+        await c.flushStandardHR()
+        let hr = try await store.hrSamples(deviceId: "my-whoop", from: 0, to: Int.max, limit: 10)
+        let rr = try await store.rrIntervals(deviceId: "my-whoop", from: 0, to: Int.max, limit: 10)
+        XCTAssertEqual(hr.count, 1)
+        XCTAssertEqual(hr[0].bpm, 61)
+        XCTAssertEqual(rr.count, 1)
+        XCTAssertEqual(rr[0].rrMs, 800)
+    }
+
+    func testStandardHRIgnoresNonPositiveBpm() async throws {
+        let store = try await makeStore()
+        let c = Collector(store: store, deviceId: "my-whoop",
+                          policy: .init(maxFrames: 100, maxInterval: 3600))
+        c.ingestStandardHR(bpm: 0, rrMs: [])
+        XCTAssertEqual(c.standardBufferedCount, 0, "non-positive bpm must not be buffered")
+    }
+
+    func testStandardHRThresholdTriggersAutoFlush() async throws {
+        let store = try await makeStore()
+        let c = Collector(store: store, deviceId: "my-whoop",
+                          policy: .init(maxFrames: 100, maxInterval: 3600))
+        for _ in 0..<20 { c.ingestStandardHR(bpm: 60, rrMs: []) }   // hits the 20-reading threshold
+        // The auto-flush is a detached Task; give it a beat to run.
+        try await Task.sleep(nanoseconds: 200_000_000)
+        let hr = try await store.hrSamples(deviceId: "my-whoop", from: 0, to: Int.max, limit: 50)
+        XCTAssertEqual(hr.count, 20)
+        XCTAssertEqual(c.standardBufferedCount, 0)
+    }
+
+    func testGenericFlushAlsoDrainsStandardHRBuffer() async throws {
+        let store = try await makeStore()
+        let c = Collector(store: store, deviceId: "my-whoop",
+                          policy: .init(maxFrames: 100, maxInterval: 3600))
+        c.ingestStandardHR(bpm: 58, rrMs: [])   // below the standalone threshold
+        XCTAssertEqual(c.standardBufferedCount, 1)
+        await c.flush()   // the same flush() the app calls on disconnect
+        XCTAssertEqual(c.standardBufferedCount, 0, "flush() must drain standard-HR readings too")
+        let hr = try await store.hrSamples(deviceId: "my-whoop", from: 0, to: Int.max, limit: 10)
+        XCTAssertEqual(hr.count, 1)
+    }
 }
 
 /// Test double proving decoded-before-raw ordering (WhoopStore is final → protocol seam).

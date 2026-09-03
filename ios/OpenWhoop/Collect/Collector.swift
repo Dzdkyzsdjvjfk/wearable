@@ -70,6 +70,16 @@ final class Collector {
     private var batchStartedAt: TimeInterval
     var bufferedCount: Int { buffer.count }
 
+    /// Readings already decoded from the standard BLE Heart Rate characteristic (0x2A37).
+    /// Separate from `buffer` because 2A37 payloads are not WhoopPacket-framed, so there is
+    /// nothing to reassemble/extractStreams here; each reading is stamped with wall-clock
+    /// `now()` directly (no device-clock correlation needed -- 2A37 always reports the current
+    /// moment). See ingestStandardHR(bpm:rrMs:) below.
+    private var standardHR: [HRSample] = []
+    private var standardRR: [RRInterval] = []
+    private var standardBatchStartedAt: TimeInterval
+    var standardBufferedCount: Int { standardHR.count + standardRR.count }
+
     init(store: StoreWriting, deviceId: String,
          policy: CollectorPolicy = .default,
          enableRawCapture: Bool = false,
@@ -79,6 +89,7 @@ final class Collector {
         self.enableRawCapture = enableRawCapture
         self.now = now; self.monotonic = monotonic
         self.batchStartedAt = monotonic()
+        self.standardBatchStartedAt = monotonic()
         self.concreteStore = store as? WhoopStore
     }
 
@@ -124,6 +135,9 @@ final class Collector {
     /// Buffer is snapshotted and cleared SYNCHRONOUSLY before the first await so that any
     /// concurrent ingest() calls during persistence accumulate into the NEXT batch cleanly.
     func flush() async {
+        // Always drain the standard-HR buffer too, independent of the frame/clockRef gate below,
+        // so a disconnect (which calls flush()) never drops the last few 2A37 readings.
+        await flushStandardHR()
         guard let ref = clockRef, !buffer.isEmpty else { return }
         // SNAPSHOT + CLEAR before any await: decoded-before-raw ordering AND the
         // buffer-snapshot-before-await invariant are both satisfied here.
@@ -153,6 +167,47 @@ final class Collector {
             startTs: tsValues.min() ?? wall, endTs: tsValues.max() ?? wall,
             frameCount: frames.count, byteSize: frames.reduce(0) { $0 + $1.count })
         try? await store.enqueueRawBatch(meta, frames: frames)
+    }
+
+    // MARK: - Standard BLE Heart Rate (0x2A37) live path
+    //
+    // The custom-protocol REALTIME_DATA stream (routed through ingest(_:)/flush() above) can be
+    // gated off (e.g. right after connect, or while a research toggle is off), while 0x2A37 is
+    // always subscribed and notifies continuously whenever the strap is worn. Without this path,
+    // a live pulse can show correctly on screen (state.heartRate, set directly from 0x2A37) while
+    // nothing gets persisted -- this is what actually saves it. Buffered on its own small cadence
+    // so it does not depend on clockRef or the frame threshold used by the custom-protocol path.
+
+    /// Ingest one already-decoded reading from the standard Heart Rate characteristic.
+    /// No-op for a non-positive bpm (guards against a malformed/zero reading).
+    func ingestStandardHR(bpm: Int, rrMs: [Int]) {
+        guard bpm > 0 else { return }
+        let ts = now()
+        standardHR.append(HRSample(ts: ts, bpm: bpm))
+        for rr in rrMs { standardRR.append(RRInterval(ts: ts, rrMs: rr)) }
+        let threshold = 20   // small: 2A37 notifies roughly once per second
+        if standardBufferedCount >= threshold
+            || (monotonic() - standardBatchStartedAt) >= policy.maxInterval {
+            Task { @MainActor in await self.flushStandardHR() }
+        }
+    }
+
+    /// Persist buffered standard-HR/RR readings. No-op when empty. On failure, re-buffers at the
+    /// front for retry on the next cadence -- mirrors flush()'s error handling above.
+    func flushStandardHR() async {
+        guard standardBufferedCount > 0 else { return }
+        let hr = standardHR
+        let rr = standardRR
+        standardHR.removeAll(keepingCapacity: true)
+        standardRR.removeAll(keepingCapacity: true)
+        do {
+            try await store.insert(Streams(hr: hr, rr: rr), deviceId: deviceId)
+        } catch {
+            standardHR.insert(contentsOf: hr, at: 0)
+            standardRR.insert(contentsOf: rr, at: 0)
+            return
+        }
+        standardBatchStartedAt = monotonic()
     }
 
     // MARK: - On-demand raw capture

@@ -554,6 +554,11 @@ public final class BLEManager: NSObject, ObservableObject {
         if !m.rr.isEmpty { state.rr = m.rr }
         // HR: prefer the custom stream once bonded; use 0x2A37 HR as a pre-bond fallback.
         if state.heartRate == nil || !state.bonded { state.heartRate = m.hr }
+        // PERSIST too, not just display: 0x2A37 is always subscribed and is the one channel
+        // guaranteed to be flowing whenever the strap is worn, regardless of whether the
+        // custom-protocol realtime stream happens to be toggled on. Without this, a live pulse
+        // can show correctly on screen while nothing actually gets saved locally.
+        collector?.ingestStandardHR(bpm: m.hr, rrMs: m.rr)
     }
 }
 
