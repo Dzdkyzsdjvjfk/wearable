@@ -30,13 +30,20 @@ jobs:
           cd ios
           xcodegen generate
 
+      # Pick whatever simulator the runner image actually ships instead of hard-coding a device
+      # name: the available models change with every Xcode release, and a name that is not
+      # installed fails the job with "Unable to find a device matching the provided destination"
+      # before a single test has run.
       - name: Run unit tests
         run: |
           cd ios
+          UDID=$(xcrun simctl list devices available --json \
+            | python3 -c 'import json,sys; d=json.load(sys.stdin)["devices"]; print([x["udid"] for rt in d for x in d[rt] if x.get("isAvailable") and "iPhone" in x["name"]][0])')
+          echo "Testing on simulator $UDID"
           xcodebuild test \
             -project OpenWhoop.xcodeproj \
             -scheme OpenWhoop \
-            -destination 'platform=iOS Simulator,name=iPhone 16' \
+            -destination "id=$UDID" \
             CODE_SIGNING_ALLOWED=NO
 
   build:
