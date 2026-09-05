@@ -246,7 +246,7 @@ final class LocalMetricsEngineTests: XCTestCase {
 
     // MARK: - End-to-end
 
-    func testComputeNightsProducesADailyRowWithSleepAndHeartMetrics() {
+    func testComputeNightsProducesADailyRowWithSleepAndHeartMetrics() throws {
         let start = 1_700_000_000
         let hr = nightSeries(start: start, awakeHours: 4, sleepHours: 8)
         // R-R across the sleep stretch, mildly variable so RMSSD is well defined.
@@ -266,10 +266,18 @@ final class LocalMetricsEngineTests: XCTestCase {
         XCTAssertLessThan(n.session.startTs, n.session.endTs)
         XCTAssertEqual(n.daily.day.count, 10, "day key must be YYYY-MM-DD")
 
-        // Deliberately not computed on-device — must stay nil rather than be invented.
-        XCTAssertNil(n.daily.deepMin)
-        XCTAssertNil(n.daily.remMin)
-        XCTAssertNil(n.daily.lightMin)
+        // Sleep phases ARE now estimated (see SleepStaging.swift), but only when the night has
+        // enough data to support it. Either way the three must agree with each other and with the
+        // reported sleep duration — a half-filled set would mean the engine invented one of them.
+        if let deep = n.daily.deepMin {
+            let rem = try XCTUnwrap(n.daily.remMin)
+            let light = try XCTUnwrap(n.daily.lightMin)
+            XCTAssertEqual(deep + rem + light, try XCTUnwrap(n.daily.totalSleepMin), accuracy: 1.0)
+        } else {
+            XCTAssertNil(n.daily.remMin)
+            XCTAssertNil(n.daily.lightMin)
+        }
+        // Still genuinely not derivable: the strap sends only raw ADC counts for these.
         XCTAssertNil(n.daily.spo2Pct)
         XCTAssertNil(n.daily.respRateBpm)
 

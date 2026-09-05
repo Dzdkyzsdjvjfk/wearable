@@ -161,7 +161,8 @@ struct MetricChart: View {
         ForEach(series) { pt in
             AreaMark(
                 x: .value("Date", pt.date),
-                y: .value(kind.title, pt.value)
+                y: .value(kind.title, pt.value),
+                series: .value("Segment", pt.segment)
             )
             .foregroundStyle(
                 LinearGradient(
@@ -173,10 +174,13 @@ struct MetricChart: View {
             .interpolationMethod(.catmullRom)
         }
         // Line
+        // series: — points from different segments are never connected, so a gap in the data
+        // stays a gap instead of being drawn as a long straight line across it.
         ForEach(series) { pt in
             LineMark(
                 x: .value("Date", pt.date),
-                y: .value(kind.title, pt.value)
+                y: .value(kind.title, pt.value),
+                series: .value("Segment", pt.segment)
             )
             .foregroundStyle(color)
             .lineStyle(StrokeStyle(lineWidth: 2, lineCap: .round, lineJoin: .round))

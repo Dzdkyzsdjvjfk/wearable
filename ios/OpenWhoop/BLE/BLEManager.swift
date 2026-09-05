@@ -353,6 +353,8 @@ public final class BLEManager: NSObject, ObservableObject {
         backfillTimeout = nil
         backfillFrameQueue.removeAll()
         log("Backfill: session ended — reason=\(reason)")
+        // The offload monopolises the link; re-arm the realtime stream so live capture resumes.
+        if AppSettings.highDensityHR { send(.toggleRealtimeHR, payload: [0x01]) }
         uploadOpportunistically()
         // Read-path sync runs AFTER the offload, never concurrently with it — the offload and the
         // pull share the WhoopStore actor, and a large first-run pull would starve the Backfiller's
@@ -762,6 +764,11 @@ extension BLEManager: CBPeripheralDelegate {
                                            // identity clockRef — but a real correlation helps realtime decode.)
         }
         send(.sendR10R11Realtime, payload: [0x00])   // stop the type-43 realtime flood (BLE airtime/battery)
+        // Type-40 REALTIME_DATA: ~1 Hz heart rate WITH R-R intervals, which is the only dense
+        // source of beat-to-beat data there is. The strap's own history records carry an R-R count
+        // only now and then, which is why HRV and the stress index had so little to work with.
+        // Cheap compared to the type-43 raw flood stopped just above (a few bytes per second).
+        if AppSettings.highDensityHR { send(.toggleRealtimeHR, payload: [0x01]) }
         send(.getDataRange)                          // refresh the strap's stored range for the watchdog
         // Plain offload (no high-freq-sync), rate-limited (first connect always runs; reconnect-flaps are
         // throttled by BackfillPolicy). Deferred ~1.5s so SET_CLOCK/GET_DATA_RANGE round-trip first and
@@ -824,7 +831,11 @@ extension BLEManager: CBPeripheralDelegate {
                 // unblocks both the Collector (live path) and the Backfiller (chunk decoding).
                 if clockRef == nil {
                     let parsed = parseFrame(frame)
-                    if let ref = ClockCorrelation.clockRef(from: parsed, wall: Int(Date().timeIntervalSince1970)) {
+                    // GET_CLOCK first; a realtime frame is the fallback when the strap stays
+                    // silent on it, so live data is never stranded waiting for a correlation.
+                    let wallNow = Int(Date().timeIntervalSince1970)
+                    if let ref = ClockCorrelation.clockRef(from: parsed, wall: wallNow)
+                        ?? ClockCorrelation.realtimeClockRef(from: parsed, wall: wallNow) {
                         clockRef = ref
                         collector?.clockRef = ref                  // unblocks buffered persistence
                         backfiller?.clockRef = ref                 // unblocks historical chunk decode

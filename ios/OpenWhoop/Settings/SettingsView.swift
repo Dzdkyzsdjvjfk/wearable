@@ -105,6 +105,9 @@ struct SettingsView: View {
     @State private var saveStatus: SaveStatus = .idle
     @State private var isBackfilling = false
 
+    // Capture quality
+    @State private var highDensityHR = AppSettings.highDensityHR
+
     // Backup / restore
     @State private var backupURL: URL?
     @State private var isExporting = false
@@ -148,6 +151,7 @@ struct SettingsView: View {
                 ageSection
                 sexSection
                 saveSection
+                captureSection
                 backupSection
                 diagnosticsSection
                 footerSection
@@ -305,6 +309,24 @@ struct SettingsView: View {
                 }
                 .listRowBackground(Color.clear)
             }
+        }
+    }
+
+    // MARK: - Capture quality
+
+    private var captureSection: some View {
+        Section {
+            Toggle(isOn: $highDensityHR) {
+                Text("Hohe Messdichte")
+                    .foregroundStyle(WH.Color.textPrimary)
+            }
+            .onChange(of: highDensityHR) { AppSettings.highDensityHR = $0 }
+        } header: {
+            Text("Messgenauigkeit")
+        } footer: {
+            Text("Holt den 1-Sekunden-Datenstrom vom Band, solange es verbunden ist. Der Verlauf, den das Band selbst speichert, enthält nur selten R-R-Intervalle — und genau die braucht es für HRV, Stress und Schlafphasen. Kostet etwas Bandakku. Wirkt ab der nächsten Verbindung.")
+                .font(WH.Font.caption)
+                .foregroundStyle(WH.Color.textSecondary)
         }
     }
 

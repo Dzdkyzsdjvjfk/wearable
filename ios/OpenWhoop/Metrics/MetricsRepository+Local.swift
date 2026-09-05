@@ -76,8 +76,12 @@ extension MetricsRepository {
         guard hr.count >= 100 else { return }   // not enough to say anything meaningful
         let rr = (try? await store.rrIntervals(deviceId: deviceId, from: from, to: now,
                                                limit: 400_000)) ?? []
+        // Wrist motion, when the strap's history records carry it: the sleep stager needs it to
+        // tell REM (still, but heart rate up) from being awake (moving, heart rate up).
+        let motion = (try? await store.gravitySamples(deviceId: deviceId, from: from, to: now,
+                                                      limit: 400_000)) ?? []
 
-        let nights = LocalMetricsEngine.computeNights(hr: hr, rr: rr)
+        let nights = LocalMetricsEngine.computeNights(hr: hr, rr: rr, motion: motion)
         guard !nights.isEmpty else { return }
 
         let fromDay = LocalMetricsEngine.dayString(forEpoch: from)
@@ -228,6 +232,7 @@ extension MetricsRepository {
         let spo2 = (try? await store.spo2Samples(deviceId: deviceId, from: weekAgo, to: now, limit: probe))?.count ?? 0
         let temp = (try? await store.skinTempSamples(deviceId: deviceId, from: weekAgo, to: now, limit: probe))?.count ?? 0
         let resp = (try? await store.respSamples(deviceId: deviceId, from: weekAgo, to: now, limit: probe))?.count ?? 0
+        let motion = (try? await store.gravitySamples(deviceId: deviceId, from: weekAgo, to: now, limit: probe))?.count ?? 0
 
         out.rawStreams = [
             item("hr", "Herzfrequenz", hr, 500),
@@ -235,6 +240,8 @@ extension MetricsRepository {
             item("spo2", "SpO2 (Rohwerte)", spo2, 100, note: "nur Roh-ADC, nicht umrechenbar"),
             item("temp", "Hauttemperatur (Rohwerte)", temp, 100, note: "nur Roh-ADC, nicht umrechenbar"),
             item("resp", "Atmung (Rohwerte)", resp, 100, note: "nur Roh-ADC, nicht umrechenbar"),
+            item("motion", "Bewegung (Beschleunigung)", motion, 500,
+                 note: "Basis für Schlafphasen"),
         ]
 
         // --- Derived metrics: what could actually be computed from those streams? ---
@@ -242,7 +249,9 @@ extension MetricsRepository {
                                                 to: now, limit: 250_000)) ?? []
         let rrAll = (try? await store.rrIntervals(deviceId: deviceId, from: now - 14 * 86_400,
                                                   to: now, limit: 400_000)) ?? []
-        let nights = LocalMetricsEngine.computeNights(hr: hrAll, rr: rrAll)
+        let motionAll = (try? await store.gravitySamples(deviceId: deviceId, from: now - 14 * 86_400,
+                                                         to: now, limit: 400_000)) ?? []
+        let nights = LocalMetricsEngine.computeNights(hr: hrAll, rr: rrAll, motion: motionAll)
         out.nightsComputed = nights.count
         let latest = nights.last?.daily
 
@@ -289,6 +298,22 @@ extension MetricsRepository {
                 ? "Zu wenige R-R-Intervalle"
                 : "\(stressPoints.count) Messfenster · Ø \(Int(stressAvg.rounded()))")
 
+        // Sleep phases: estimated from heart rate + R-R + motion (see SleepStaging.swift). Says
+        // plainly which inputs were available, because motion-less staging is the weaker mode.
+        let staged = nights.last?.daily
+        let stageItem: TrackingDiagnosticItem = {
+            guard let deep = staged?.deepMin, let rem = staged?.remMin else {
+                return TrackingDiagnosticItem(
+                    id: "stages", name: "Schlafphasen (Tief/REM)", status: .missing,
+                    detail: motionAll.isEmpty
+                        ? "Keine Bewegungsdaten vom Band — Schätzung nicht möglich"
+                        : "Zu wenige Messwerte in der Nacht")
+            }
+            return TrackingDiagnosticItem(
+                id: "stages", name: "Schlafphasen (Schätzung)", status: .ok,
+                detail: String(format: "Tief %.0f min · REM %.0f min", deep, rem))
+        }()
+
         out.metrics = [
             metricItem("sleep", "Schlafdauer", sleepMin, sleepText,
                        missingHint: "Keine Nacht erkannt — mind. 2 h zusammenhängende Daten nötig"),
@@ -306,8 +331,7 @@ extension MetricsRepository {
                        strain.map { String(format: "%.1f / 21", $0) } ?? "",
                        missingHint: "Zu wenige Messwerte am Tag"),
             stressItem,
-            TrackingDiagnosticItem(id: "stages", name: "Schlafphasen (Tief/REM)", status: .missing,
-                           detail: "Nicht berechenbar — das Band sendet die nötigen Signale nicht"),
+            stageItem,
             TrackingDiagnosticItem(id: "spo2pct", name: "SpO2 in Prozent", status: .missing,
                            detail: "Nicht berechenbar — Umrechnung passiert in WHOOPs Cloud"),
         ]

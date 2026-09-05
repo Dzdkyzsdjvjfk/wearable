@@ -25,8 +25,11 @@ import WhoopStore
 //                  window and filtering.
 //   - sleep      — start/end/duration/efficiency from a heart-rate-based detector. Reasonable
 //                  for "when did I sleep and roughly how long", not a clinical measurement.
-//   - deep/REM/light — NOT computed. Sleep staging needs signals the strap does not expose
-//                  on the wire. Left nil on purpose rather than invented (see FINDINGS.md).
+//   - deep/REM/light — estimated by SleepStaging from heart rate, R-R intervals and wrist
+//                  motion. This is the method wrist wearables actually use (EEG is what a sleep
+//                  lab scores, and the strap indeed does not send that) — see SleepStaging.swift
+//                  for the feature design, the published accuracy ceiling, and when it declines
+//                  to guess. nil whenever the night's data is too thin to support it.
 //   - recovery   — an HRV-vs-personal-baseline estimate, explicitly a heuristic (see below).
 //   - strain     — a heart-rate-reserve exertion accumulation, explicitly a heuristic.
 // SpO2, skin temperature and respiration rate stay nil: the strap only emits raw ADC counts
@@ -79,10 +82,12 @@ enum LocalMetricsEngine {
     /// are known: each night is scored against the nights that came before it.
     static func computeNights(hr: [HRSample],
                               rr: [RRInterval],
+                              motion: [GravitySample] = [],
                               config: Config = .standard) -> [NightResult] {
         let sortedHR = hr.sorted { $0.ts < $1.ts }
         guard sortedHR.count >= 2 else { return [] }
         let sortedRR = rr.sorted { $0.ts < $1.ts }
+        let sortedMotion = motion.sorted { $0.ts < $1.ts }
 
         let windows = detectSleepWindows(hr: sortedHR, config: config)
         guard !windows.isEmpty else { return [] }
@@ -93,18 +98,24 @@ enum LocalMetricsEngine {
             let restingHr: Int?
             let avgHrv: Double?
             let strain: Double?
+            let staging: StagingResult?
         }
 
         var drafts: [Draft] = []
         for w in windows {
             let rhr = restingHeartRate(hr: sortedHR, from: w.start, to: w.end)
-            let hrv = rmssd(rr: sortedRR, from: w.start, to: w.end)
+            // Windowed, artefact-filtered HRV rather than one RMSSD across the whole night —
+            // see HRVAnalysis.swift for why that matters.
+            let hrv = HRVAnalysis.analyse(rr: sortedRR, from: w.start, to: w.end)?.rmssd
+            let staging = SleepStaging.stage(hr: sortedHR, rr: sortedRR, motion: sortedMotion,
+                                             from: w.start, to: w.end)
             // Strain covers the waking day that FOLLOWS this night, i.e. from wake-up until
             // the next sleep onset (or 24 h later, whichever comes first).
             let dayEnd = min(w.end + 86_400, sortedHR.last?.ts ?? w.end)
             let st = strain(hr: sortedHR, from: w.end, to: dayEnd,
                             restingHr: rhr, maxHeartRate: config.maxHeartRate)
-            drafts.append(Draft(window: w, restingHr: rhr, avgHrv: hrv, strain: st))
+            drafts.append(Draft(window: w, restingHr: rhr, avgHrv: hrv, strain: st,
+                                staging: staging))
         }
 
         // Second pass: recovery against the preceding nights' baseline.
@@ -118,19 +129,36 @@ enum LocalMetricsEngine {
                                baselineRhr: priorRhr)
 
             let w = d.window
+            // Efficiency from the stager when it ran: time actually asleep out of time in bed is
+            // a better answer than the bin-threshold estimate, because the stager also labels the
+            // wake epochs inside the night.
+            let efficiency: Double = {
+                guard let s = d.staging else { return w.efficiency }
+                let total = s.deepMinutes + s.remMinutes + s.lightMinutes + s.wakeMinutes
+                guard total > 0 else { return w.efficiency }
+                return min(1.0, (total - s.wakeMinutes) / total)
+            }()
+
             let session = CachedSleepSession(startTs: w.start,
                                              endTs: w.end,
-                                             efficiency: w.efficiency,
+                                             efficiency: efficiency,
                                              restingHr: d.restingHr,
                                              avgHrv: d.avgHrv,
-                                             stagesJSON: nil)
+                                             stagesJSON: d.staging.flatMap {
+                                                 SleepStaging.stagesJSON($0.stages)
+                                             })
+
+            let asleepMinutes: Double = {
+                guard let s = d.staging else { return w.asleepMinutes }
+                return s.deepMinutes + s.remMinutes + s.lightMinutes
+            }()
 
             let daily = DailyMetric(day: dayString(forEpoch: w.end),
-                                    totalSleepMin: w.asleepMinutes,
-                                    efficiency: w.efficiency,
-                                    deepMin: nil,      // not derivable on-device — see file header
-                                    remMin: nil,
-                                    lightMin: nil,
+                                    totalSleepMin: asleepMinutes,
+                                    efficiency: efficiency,
+                                    deepMin: d.staging?.deepMinutes,
+                                    remMin: d.staging?.remMinutes,
+                                    lightMin: d.staging?.lightMinutes,
                                     disturbances: w.disturbances,
                                     restingHr: d.restingHr,
                                     avgHrv: d.avgHrv,

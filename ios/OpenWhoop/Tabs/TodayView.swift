@@ -547,7 +547,9 @@ struct TodayView: View {
         for p in live.hrHistory where p.date >= cutoff {
             bySecond[Int(p.date.timeIntervalSince1970)] = p
         }
-        return bySecond.keys.sorted().compactMap { bySecond[$0] }
+        // 3 minutes without a reading is a hole in the recording, not a slow drift — split the
+        // line there so the chart shows the hole.
+        return bySecond.keys.sorted().compactMap { bySecond[$0] }.segmented(maxGap: 180)
     }
 
     /// Loads the stored part of the chart. Cheap enough to redo whenever the screen appears, a
