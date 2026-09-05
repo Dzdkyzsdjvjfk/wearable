@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 // MARK: - Profile model
 
@@ -56,7 +57,9 @@ enum ProfileUnits {
 
 // MARK: - Local persistence
 
-private enum ProfileStorage {
+/// Deliberately not private: the on-device workout detector reads age/weight/sex from here for
+/// max-HR scaling and the calorie estimate, which is what makes both work with no server.
+enum ProfileStorage {
     static let key = "com.openwhoop.profile.v1"
 
     static func load() -> Profile? {
@@ -102,6 +105,12 @@ struct SettingsView: View {
     @State private var saveStatus: SaveStatus = .idle
     @State private var isBackfilling = false
 
+    // Backup / restore
+    @State private var backupURL: URL?
+    @State private var isExporting = false
+    @State private var showImporter = false
+    @State private var backupStatus: String?
+
     private enum SaveStatus: Equatable {
         case idle
         case saving
@@ -139,6 +148,7 @@ struct SettingsView: View {
                 ageSection
                 sexSection
                 saveSection
+                backupSection
                 diagnosticsSection
                 footerSection
             }
@@ -298,11 +308,93 @@ struct SettingsView: View {
         }
     }
 
+    // MARK: - Backup / restore
+    //
+    // The one manual step that makes the history survive a reinstall: the database lives in the
+    // app sandbox, and re-sideloading with a fresh certificate can wipe it. Exported files belong
+    // somewhere outside the app — iCloud Drive or Files. See BackupService.swift.
+
+    private var backupSection: some View {
+        Section {
+            Button {
+                Task { await exportBackup() }
+            } label: {
+                HStack {
+                    Label("Backup erstellen", systemImage: "arrow.clockwise.icloud")
+                        .foregroundStyle(WH.Color.textPrimary)
+                    Spacer()
+                    if isExporting { ProgressView().tint(WH.Color.textSecondary) }
+                }
+            }
+            .disabled(isExporting)
+
+            // Appears once a file exists; the system share sheet is what actually gets it out of
+            // the app sandbox and into Files / iCloud Drive, where a reinstall can't touch it.
+            if let url = backupURL {
+                ShareLink(item: url) {
+                    Label("Backup speichern / teilen", systemImage: "square.and.arrow.up")
+                        .foregroundStyle(WH.Color.recoveryGreen)
+                }
+            }
+
+            Button {
+                showImporter = true
+            } label: {
+                Label("Backup einspielen", systemImage: "square.and.arrow.down")
+                    .foregroundStyle(WH.Color.textPrimary)
+            }
+
+            if let backupStatus {
+                Text(backupStatus)
+                    .font(WH.Font.caption)
+                    .foregroundStyle(WH.Color.textSecondary)
+            }
+        } header: {
+            Text("Daten")
+        } footer: {
+            Text("Sichert alle Messwerte in eine Datei — am besten in iCloud Drive ablegen. Beim Neuinstallieren der App (spätestens alle 7 Tage) geht die interne Datenbank sonst verloren. Das Einspielen ergänzt nur, es löscht nie etwas.")
+                .font(WH.Font.caption)
+                .foregroundStyle(WH.Color.textSecondary)
+        }
+        .fileImporter(isPresented: $showImporter,
+                      allowedContentTypes: [.json],
+                      allowsMultipleSelection: false) { result in
+            guard case .success(let urls) = result, let url = urls.first else { return }
+            Task { await importBackup(url) }
+        }
+    }
+
+    private func exportBackup() async {
+        isExporting = true
+        backupStatus = nil
+        do {
+            let url = try await metrics.exportBackup()
+            let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+            let bytes = (attrs?[.size] as? NSNumber)?.doubleValue ?? 0
+            backupStatus = String(format: "Backup erstellt (%.1f MB) — jetzt speichern:",
+                                  bytes / 1_048_576)
+            backupURL = url
+        } catch {
+            backupStatus = "Backup fehlgeschlagen: \(error.localizedDescription)"
+        }
+        isExporting = false
+    }
+
+    private func importBackup(_ url: URL) async {
+        backupStatus = "Backup wird eingespielt…"
+        do {
+            let counts = try await metrics.restoreBackup(from: url)
+            backupStatus = "\(counts.totalRows) Messwerte ergänzt · \(counts.sleepSessions) Nächte"
+        } catch {
+            backupStatus = error.localizedDescription
+        }
+    }
+
     private var footerSection: some View {
         Section {
             EmptyView()
         } footer: {
-            Text("Height, weight, age, and sex are used server-side for calorie estimation, HRmax calculation, and strain analysis. They are stored on your personal server only.")
+            Text("Height, weight, age, and sex stay on this phone (and on your own server, if you configure one). Age sets your max heart rate for strain and the workout threshold; weight and sex enable the calorie estimate for detected workouts.")
                 .font(WH.Font.caption)
                 .foregroundStyle(WH.Color.textSecondary)
         }

@@ -34,10 +34,17 @@ struct CollectorPolicy {
     /// ~4096 frames at ~60 bytes/frame is ~240KB, far beyond the handful seen pre-clock
     /// normally. Custom init keeps `.init(maxFrames:maxInterval:)` call sites compiling.
     var maxPreClockFrames: Int
-    init(maxFrames: Int, maxInterval: TimeInterval, maxPreClockFrames: Int = 4096) {
+    /// Flush cadence for the standard-HR (0x2A37) buffer, which is independent of the frame
+    /// buffer above. Deliberately much shorter: those readings need no clock correlation, so
+    /// there is nothing to wait for and a short interval means a freshly-worn strap shows up in
+    /// the stored data (and therefore in the charts) almost immediately.
+    var standardMaxInterval: TimeInterval
+    init(maxFrames: Int, maxInterval: TimeInterval, maxPreClockFrames: Int = 4096,
+         standardMaxInterval: TimeInterval = 10) {
         self.maxFrames = maxFrames
         self.maxInterval = maxInterval
         self.maxPreClockFrames = maxPreClockFrames
+        self.standardMaxInterval = standardMaxInterval
     }
     static let `default` = CollectorPolicy(maxFrames: 64, maxInterval: 30, maxPreClockFrames: 4096)
 }
@@ -58,6 +65,11 @@ final class Collector {
     /// decoded-only. Injected for tests; backed by UserDefaults in the production init site.
     private let enableRawCapture: Bool
     private let now: () -> Int
+    /// Wall clock in MILLIseconds. Used only by the standard-HR path, which reconstructs each
+    /// individual beat's own moment from the R-R durations (see ingestStandardHR). Defaults to
+    /// `now() * 1000` so tests injecting a fake `now` stay deterministic; the production init
+    /// site passes a real millisecond clock.
+    private let nowMs: () -> Int
     private let monotonic: () -> TimeInterval
 
     /// Set once the GET_CLOCK correlation lands (E1). Until then, frames buffer un-persisted.
@@ -84,10 +96,12 @@ final class Collector {
          policy: CollectorPolicy = .default,
          enableRawCapture: Bool = false,
          now: @escaping () -> Int = { Int(Date().timeIntervalSince1970) },
+         nowMs: (() -> Int)? = nil,
          monotonic: @escaping () -> TimeInterval = { Date().timeIntervalSinceReferenceDate }) {
         self.store = store; self.deviceId = deviceId; self.policy = policy
         self.enableRawCapture = enableRawCapture
         self.now = now; self.monotonic = monotonic
+        self.nowMs = nowMs ?? { now() * 1000 }
         self.batchStartedAt = monotonic()
         self.standardBatchStartedAt = monotonic()
         self.concreteStore = store as? WhoopStore
@@ -180,14 +194,39 @@ final class Collector {
 
     /// Ingest one already-decoded reading from the standard Heart Rate characteristic.
     /// No-op for a non-positive bpm (guards against a malformed/zero reading).
+    ///
+    /// PER-BEAT TIMESTAMPS: one notification carries the R-R intervals of the beats that just
+    /// happened, oldest first. Stamping them all with the arrival second was wrong twice over:
+    ///   1. `rrInterval`'s natural key is (deviceId, ts, rrMs), so two beats of the same length
+    ///      inside one second collapsed into a single stored row — silently dropping beats.
+    ///   2. HRV (RMSSD) and the stress index read successive differences, so squashing several
+    ///      beats onto one instant distorts both.
+    /// The last interval ended at arrival, so beat i's own moment is arrival minus the sum of the
+    /// intervals that came after it. That reconstruction is exact to the strap's own measurement,
+    /// needs no extra protocol data, and spreads the beats across real seconds.
     func ingestStandardHR(bpm: Int, rrMs: [Int]) {
         guard bpm > 0 else { return }
-        let ts = now()
-        standardHR.append(HRSample(ts: ts, bpm: bpm))
-        for rr in rrMs { standardRR.append(RRInterval(ts: ts, rrMs: rr)) }
-        let threshold = 20   // small: 2A37 notifies roughly once per second
+        let arrivalMs = nowMs()
+        standardHR.append(HRSample(ts: arrivalMs / 1000, bpm: bpm))
+
+        // Walk newest → oldest accumulating the offset back from arrival, then restore order.
+        var offsetsMs: [Int] = []
+        offsetsMs.reserveCapacity(rrMs.count)
+        var acc = 0
+        for rr in rrMs.reversed() {
+            offsetsMs.append(acc)
+            acc += max(0, rr)
+        }
+        for (i, rr) in rrMs.enumerated() {
+            let offset = offsetsMs[rrMs.count - 1 - i]
+            standardRR.append(RRInterval(ts: (arrivalMs - offset) / 1000, rrMs: rr))
+        }
+
+        // Small threshold: 2A37 notifies about once per second, so this lands the first readings
+        // in the database within seconds of connecting instead of after half a minute.
+        let threshold = 8
         if standardBufferedCount >= threshold
-            || (monotonic() - standardBatchStartedAt) >= policy.maxInterval {
+            || (monotonic() - standardBatchStartedAt) >= policy.standardMaxInterval {
             Task { @MainActor in await self.flushStandardHR() }
         }
     }

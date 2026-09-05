@@ -257,12 +257,31 @@ final class MetricsRepository: ObservableObject {
 
     // MARK: - Workouts (M5)
 
-    /// Fetches auto-detected workout bouts from the server for the given date range.
-    /// Calls ensureOpen() to initialise the store/sync stack, then delegates to ServerSync.
-    /// Returns [] when unconfigured (no API key), offline, or on parse error — never throws.
+    /// Workout bouts for the given date range (YYYY-MM-DD UTC bounds, inclusive).
+    ///
+    /// Server first when one is configured; on-device detection otherwise, or whenever the server
+    /// has nothing for the range. Without this fallback the tab stayed empty forever on a
+    /// personal build even though the heart-rate stream needed to find the bouts was already on
+    /// disk — see WorkoutDetector.swift. Never throws.
     func workouts(from: String, to: String) async -> [Workout] {
         await ensureOpen()
-        return await serverSync?.getWorkouts(from: from, to: to) ?? []
+        if let serverSync {
+            let remote = await serverSync.getWorkouts(from: from, to: to)
+            if !remote.isEmpty { return remote }
+        }
+        guard let fromEpoch = MetricsRepository.epoch(startOfDay: from),
+              let toEpoch = MetricsRepository.epoch(startOfDay: to) else { return [] }
+        return await localWorkouts(fromEpoch: fromEpoch, toEpoch: toEpoch + 86_400)
+    }
+
+    /// YYYY-MM-DD (UTC) → epoch seconds at 00:00. nil for an unparseable string.
+    static func epoch(startOfDay day: String) -> Int? {
+        let fmt = DateFormatter()
+        fmt.calendar = Calendar(identifier: .gregorian)
+        fmt.locale = Locale(identifier: "en_US_POSIX")
+        fmt.timeZone = TimeZone(identifier: "UTC")
+        fmt.dateFormat = "yyyy-MM-dd"
+        return fmt.date(from: day).map { Int($0.timeIntervalSince1970) }
     }
 
     // MARK: - Workout calorie backfill (M7)

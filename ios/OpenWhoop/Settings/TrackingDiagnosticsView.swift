@@ -61,6 +61,8 @@ struct TrackingDiagnosticsView: View {
 
                 summaryCard(d)
 
+                coverageCard(d)
+
                 section(title: "SIGNALE VOM BAND",
                         subtitle: "Kommt per Bluetooth an und liegt lokal auf dem iPhone.",
                         items: d.rawStreams)
@@ -94,12 +96,75 @@ struct TrackingDiagnosticsView: View {
             summaryRow("Neuester Messwert", relativeText(d.latestSample))
             summaryRow("Ausgewertete Nächte",
                        d.nightsComputed > 0 ? "\(d.nightsComputed)" : "keine")
+            summaryRow("Workouts (7 Tage)",
+                       d.workoutsDetected > 0 ? "\(d.workoutsDetected)" : "keine")
             summaryRow("Server konfiguriert", d.serverConfigured ? "ja" : "nein (rein lokal)")
         }
         .padding(WH.Spacing.md)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(WH.Color.surface,
                     in: RoundedRectangle(cornerRadius: WH.Radius.card, style: .continuous))
+    }
+
+    // MARK: - Coverage
+    //
+    // The single most useful diagnostic: a metric that "doesn't work" is nearly always a day with
+    // too few hours of data, and that is invisible in a row of X marks. One bar per day makes the
+    // gap obvious — and makes it obvious when nothing is wrong at all.
+
+    private func coverageCard(_ d: TrackingDiagnostics) -> some View {
+        VStack(alignment: .leading, spacing: WH.Spacing.sm) {
+            Text("ABDECKUNG · 7 TAGE")
+                .font(WH.Font.cardTitle)
+                .foregroundStyle(WH.Color.textSecondary)
+                .tracking(1.2)
+
+            HStack(alignment: .bottom, spacing: 6) {
+                ForEach(d.coverage) { day in
+                    VStack(spacing: 4) {
+                        GeometryReader { geo in
+                            VStack(spacing: 0) {
+                                Spacer(minLength: 0)
+                                RoundedRectangle(cornerRadius: 3)
+                                    .fill(barColor(day.fraction))
+                                    .frame(height: max(2, geo.size.height * day.fraction))
+                            }
+                        }
+                        .frame(height: 54)
+                        Text(weekdayLabel(day.date))
+                            .font(.system(size: 9))
+                            .foregroundStyle(WH.Color.textSecondary)
+                    }
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("\(weekdayLabel(day.date)): \(day.minutes / 60) Stunden Daten")
+                }
+            }
+
+            Text("Stunden mit Herzfrequenz-Daten pro Tag. Für eine Nacht braucht es mind. 2 h am Stück, für Recovery zusätzlich 3 ausgewertete Nächte.")
+                .font(.system(size: 11))
+                .foregroundStyle(WH.Color.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(WH.Spacing.md)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(WH.Color.surface,
+                    in: RoundedRectangle(cornerRadius: WH.Radius.card, style: .continuous))
+    }
+
+    private func barColor(_ fraction: Double) -> Color {
+        switch fraction {
+        case ..<0.1:  return WH.Color.separator
+        case ..<0.35: return WH.Color.recoveryRed
+        case ..<0.7:  return WH.Color.recoveryYellow
+        default:      return WH.Color.recoveryGreen
+        }
+    }
+
+    private func weekdayLabel(_ date: Date) -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "de_DE")
+        f.dateFormat = "EE"
+        return f.string(from: date)
     }
 
     private func summaryRow(_ label: String, _ value: String) -> some View {

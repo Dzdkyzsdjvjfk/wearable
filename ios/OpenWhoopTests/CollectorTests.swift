@@ -247,14 +247,54 @@ final class CollectorTests: XCTestCase {
 
     func testStandardHRThresholdTriggersAutoFlush() async throws {
         let store = try await makeStore()
+        // A clock that advances one second per reading, exactly like a real 1 Hz 2A37 stream.
+        // Without it every reading would carry the same second and the (deviceId, ts) primary key
+        // would legitimately collapse them into one row.
+        var tick = 1_700_000_000
         let c = Collector(store: store, deviceId: "my-whoop",
-                          policy: .init(maxFrames: 100, maxInterval: 3600))
-        for _ in 0..<20 { c.ingestStandardHR(bpm: 60, rrMs: []) }   // hits the 20-reading threshold
+                          policy: .init(maxFrames: 100, maxInterval: 3600),
+                          now: { defer { tick += 1 }; return tick })
+        for _ in 0..<20 { c.ingestStandardHR(bpm: 60, rrMs: []) }
         // The auto-flush is a detached Task; give it a beat to run.
         try await Task.sleep(nanoseconds: 200_000_000)
         let hr = try await store.hrSamples(deviceId: "my-whoop", from: 0, to: Int.max, limit: 50)
         XCTAssertEqual(hr.count, 20)
         XCTAssertEqual(c.standardBufferedCount, 0)
+    }
+
+    /// The bug this guards: one 2A37 notification carries several beats, and stamping them all
+    /// with the arrival second (a) collapsed equal-length beats into a single row via the
+    /// (deviceId, ts, rrMs) key and (b) handed HRV/stress several beats on one instant. Each beat
+    /// must instead carry its own reconstructed moment, walking back by the R-R durations.
+    func testStandardHRSpreadsBeatsBackwardsInTime() async throws {
+        let store = try await makeStore()
+        let arrival = 1_700_000_000
+        let c = Collector(store: store, deviceId: "my-whoop",
+                          policy: .init(maxFrames: 100, maxInterval: 3600),
+                          now: { arrival },
+                          nowMs: { arrival * 1000 })
+        c.ingestStandardHR(bpm: 60, rrMs: [1000, 1000, 1000])
+        await c.flushStandardHR()
+
+        let rr = try await store.rrIntervals(deviceId: "my-whoop", from: 0, to: Int.max, limit: 10)
+        XCTAssertEqual(rr.count, 3, "three beats must survive as three rows")
+        XCTAssertEqual(rr.map(\.ts), [arrival - 2, arrival - 1, arrival],
+                       "the last interval ends at arrival; earlier beats step back by their own length")
+    }
+
+    func testStandardHRKeepsIdenticalIntervalsThatUsedToCollapse() async throws {
+        let store = try await makeStore()
+        let arrival = 1_700_000_500
+        let c = Collector(store: store, deviceId: "my-whoop",
+                          policy: .init(maxFrames: 100, maxInterval: 3600),
+                          now: { arrival },
+                          nowMs: { arrival * 1000 })
+        // Four beats of exactly the same length — all four used to become a single stored row.
+        c.ingestStandardHR(bpm: 60, rrMs: [850, 850, 850, 850])
+        await c.flushStandardHR()
+        let rr = try await store.rrIntervals(deviceId: "my-whoop", from: 0, to: Int.max, limit: 10)
+        XCTAssertEqual(rr.count, 4)
+        XCTAssertEqual(Set(rr.map(\.ts)).count, 4, "each beat lands on its own second")
     }
 
     func testGenericFlushAlsoDrainsStandardHRBuffer() async throws {

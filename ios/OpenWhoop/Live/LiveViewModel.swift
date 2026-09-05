@@ -30,6 +30,12 @@ public final class LiveViewModel: ObservableObject {
     /// Rolling buffer of recent live HR readings, windowed to `hrHistoryWindowMinutes`.
     /// Published directly on LiveViewModel for the same reactivity reason as `stressIndex`.
     @Published private(set) var hrHistory: [TrendPoint] = []
+
+    /// Mirror of LiveState.lastSyncedAt, republished HERE for the same reason stressIndex is:
+    /// LiveState is a nested ObservableObject, so a view holding `@EnvironmentObject live` is not
+    /// notified when a property of `live.state` changes. Views that want to react to "a sync just
+    /// finished" — Today recomputes and reloads on it — must observe this, not `live.state`.
+    @Published public private(set) var lastSyncedAt: TimeInterval?
     public let hrHistoryWindowMinutes: Double = 15
     private let hrHistoryMaxPoints = 900   // safety cap regardless of the time window
 
@@ -45,8 +51,10 @@ public final class LiveViewModel: ObservableObject {
         SyncNudge.requestAuthorization()
         RecoveryNotifier.requestAuthorization()
         s.$lastSyncedAt
-            .compactMap { $0 }
-            .sink { _ in SyncNudge.reschedule() }
+            .sink { [weak self] value in
+                self?.lastSyncedAt = value
+                if value != nil { SyncNudge.reschedule() }
+            }
             .store(in: &cancellables)
 
         // Stress: LiveState.rr is a full replacement snapshot on every BLE update (not an

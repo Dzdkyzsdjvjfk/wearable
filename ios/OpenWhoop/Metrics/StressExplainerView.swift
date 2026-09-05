@@ -19,8 +19,8 @@ struct StressExplainerView: View {
                             body: "A live autonomic-stress estimate computed on your phone from the real-time R-R (heartbeat-to-heartbeat) intervals your strap streams over Bluetooth — the Baevsky Stress Index, a published heart-rate-variability formula from 1997. Lower means calmer, higher means more sympathetic (\"fight or flight\") activity."
                         )
                         section(
-                            title: "Why it only works live",
-                            body: "It needs a steady stream of real beats to compute, so it only updates while your strap is connected and streaming, and it resets when you disconnect. There's no history or daily average — that's by design, not a bug."
+                            title: "How the history works",
+                            body: "The formula needs a window of real beats, nothing more — so the same calculation runs over the R-R intervals already stored on your phone, in 5-to-30-minute bins, giving you the last 6 hours, 24 hours or 7 days. That includes stretches when the strap was recording without your phone nearby, because those beats arrive later with the strap's own history. A gap in the chart means too few beats in that window to compute anything honest — never \"calm\"."
                         )
                         section(
                             title: "What it is NOT",

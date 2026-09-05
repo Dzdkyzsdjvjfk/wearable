@@ -9,8 +9,10 @@ import UniformTypeIdentifiers
 // a user-reorderable row of tiles (HRV / Resting HR / Stress) → a live heart-rate chart →
 // strap status + sync footer.
 //
-// Tapping a metric → MetricDetailView (full history, range selector). The Stress tile has no
-// history (it's live-only by design) — tapping it opens an explainer sheet instead.
+// Tapping a metric → MetricDetailView (full history, range selector). The Stress tile opens
+// StressDetailView, which recomputes the stress index per time-bin from the stored R-R intervals
+// — so it has a real 6 h / 24 h / 7 d history, and the tile itself falls back to the most recent
+// stored reading (with its age) whenever the strap isn't connected.
 
 struct TodayView: View {
     @EnvironmentObject private var metrics: MetricsRepository
@@ -24,8 +26,12 @@ struct TodayView: View {
     // Live HR chart selection (tap-to-highlight, like the Trends HR card)
     @State private var hrChartSelected: TrendPoint?
 
-    @State private var showStressExplainer = false
     @State private var showJournal = false
+
+    /// Most recent stress reading recomputed from STORED R-R intervals, so the tile still shows a
+    /// real value (with its age) when the strap isn't currently connected — it used to fall back
+    /// to a dash the moment the live stream stopped.
+    @State private var recentStress: StressPoint?
 
     var body: some View {
         NavigationStack {
@@ -45,10 +51,12 @@ struct TodayView: View {
             .toolbar(.hidden, for: .navigationBar)
         }
         .preferredColorScheme(.dark)
-        .task { await metrics.refresh() }
-        .refreshable { await metrics.refresh() }
-        .sheet(isPresented: $showStressExplainer) {
-            StressExplainerView()
+        .task { await metrics.refresh(); await loadRecentStress() }
+        .refreshable { await metrics.refresh(); await loadRecentStress() }
+        // A completed strap sync writes new rows; recompute and reload right away so the screen
+        // reflects the data the moment it lands instead of on the next manual pull-to-refresh.
+        .onChange(of: live.lastSyncedAt) { _ in
+            Task { await metrics.refresh(); await loadRecentStress() }
         }
         .sheet(isPresented: $showJournal) {
             JournalEntryView(day: JournalStore.dayString(), dayLabel: "Today", journal: journal)
@@ -285,7 +293,9 @@ struct TodayView: View {
             NavigationLink(destination: MetricDetailView(kind: .rhr)) { rhrCard }
                 .buttonStyle(.plain)
         case .stress:
-            Button { showStressExplainer = true } label: { stressCard }
+            // Opens the stress HISTORY (recomputed from stored R-R intervals), not just the
+            // explainer — the explainer is now the (i) button inside that screen.
+            NavigationLink(destination: StressDetailView()) { stressCard }
                 .buttonStyle(.plain)
                 // Overrides MetricCard's own default label so the band (Calm/Elevated/High) is
                 // spoken too, not just the raw index number.
@@ -294,9 +304,11 @@ struct TodayView: View {
     }
 
     private var stressAccessibilityLabel: String {
-        guard let idx = live.stressIndex else { return "Stress, not available. Connect your strap to see a live reading." }
+        guard let idx = live.stressIndex ?? recentStress?.index else {
+            return "Stress, not available. Wear your strap for a few minutes to get a reading."
+        }
         let band = BaevskyStress.band(for: idx)
-        return "Stress, \(band.label), index \(Int(idx.rounded())). Double tap for more information."
+        return "Stress, \(band.label), index \(Int(idx.rounded())). Double tap to see the last 24 hours."
     }
 
     private var hrvCard: some View {
@@ -323,10 +335,26 @@ struct TodayView: View {
                           accessory: { tileAccessory() })
     }
 
+    /// Loads the last few hours of stored stress so the tile has something real to show while the
+    /// strap is disconnected. Cheap: a handful of bins, recomputed from rows already on disk.
+    private func loadRecentStress() async {
+        let now = Int(Date().timeIntervalSince1970)
+        recentStress = (await metrics.stressSeries(fromEpoch: now - 6 * 3600, toEpoch: now)).last
+    }
+
     private var stressCard: some View {
-        let idx = live.stressIndex
+        // Live reading wins; the most recent stored one stands in when the strap is away.
+        let idx = live.stressIndex ?? recentStress?.index
         let band = idx.map(BaevskyStress.band(for:))
         let value = idx.map { String(format: "%.0f", $0) } ?? "—"
+        let caption: String? = {
+            guard let band else { return nil }
+            if live.stressIndex != nil { return band.label.uppercased() }
+            guard let ts = recentStress?.ts else { return band.label.uppercased() }
+            let mins = max(0, (Int(Date().timeIntervalSince1970) - ts) / 60)
+            return mins < 60 ? "\(band.label.uppercased()) · vor \(mins) min"
+                             : "\(band.label.uppercased()) · vor \(mins / 60) h"
+        }()
         let accent: Color = {
             switch band {
             case .calm:     return WH.Color.recoveryGreen
@@ -339,7 +367,7 @@ struct TodayView: View {
                           value: value,
                           unit: nil,
                           accentColor: accent,
-                          accessory: { tileAccessory(caption: band?.label.uppercased()) })
+                          accessory: { tileAccessory(caption: caption) })
     }
 
     /// Shared accessory row for the three reorderable tiles: an optional short caption on the

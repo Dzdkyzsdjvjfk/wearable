@@ -133,7 +133,10 @@ public final class BLEManager: NSObject, ObservableObject {
         // persists raw frames. Flip "enableRawCapture" in UserDefaults to capture raw again.
         let enableRawCapture = UserDefaults.standard.bool(forKey: "enableRawCapture")
         collector = Collector(store: store, deviceId: deviceId,
-                              enableRawCapture: enableRawCapture)
+                              enableRawCapture: enableRawCapture,
+                              // Real millisecond clock so the standard-HR path can reconstruct
+                              // each individual beat's own moment from the R-R durations.
+                              nowMs: { Int(Date().timeIntervalSince1970 * 1000) })
         backfiller = Backfiller(store: store, deviceId: deviceId,
                                 ackTrim: { [weak self] trim, endData in
                                     self?.ackHistoricalChunk(trim: trim, endData: endData)

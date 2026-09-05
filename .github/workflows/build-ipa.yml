@@ -10,6 +10,35 @@ on:
       - ".github/workflows/build-ipa.yml"
 
 jobs:
+  # The unit tests existed but nothing ever ran them, so a broken assertion could sit in the repo
+  # unnoticed. This job runs them on every push. It is deliberately SEPARATE from `build` and does
+  # not gate it: a failing test must be visible without also cutting off the installable IPA.
+  test:
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Provide placeholder Secrets.xcconfig
+        run: cp ios/OpenWhoop/Config/Secrets.example.xcconfig ios/OpenWhoop/Config/Secrets.xcconfig
+
+      - name: Generate Xcode project
+        run: |
+          cd ios
+          xcodegen generate
+
+      - name: Run unit tests
+        run: |
+          cd ios
+          xcodebuild test \
+            -project OpenWhoop.xcodeproj \
+            -scheme OpenWhoop \
+            -destination 'platform=iOS Simulator,name=iPhone 16' \
+            CODE_SIGNING_ALLOWED=NO
+
   build:
     runs-on: macos-15
     steps:

@@ -1,8 +1,10 @@
 import SwiftUI
 
 // MARK: - WorkoutsView
-// M5 Workouts tab — shows auto-detected workout bouts from /v1/workouts (last 30 days).
-// Data is fetched directly from the server (no local cache); refresh on .task + pull-to-refresh.
+// M5 Workouts tab — auto-detected workout bouts for the last 30 days.
+// MetricsRepository.workouts() serves them from the server when one is configured and otherwise
+// detects them on-device from the stored heart-rate stream (see WorkoutDetector.swift), so this
+// tab works on a personal build with no server. Refresh on .task + pull-to-refresh.
 
 struct WorkoutsView: View {
     @EnvironmentObject private var metrics: MetricsRepository
@@ -183,7 +185,7 @@ struct WorkoutsView: View {
             Text("No workouts detected yet")
                 .font(.system(size: 17, weight: .semibold, design: .rounded))
                 .foregroundStyle(WH.Color.textPrimary)
-            Text("Workouts are found automatically from your heart rate data. Pull down to refresh.")
+            Text("Workouts are found on your phone from your stored heart rate: at least 10 minutes above 40 % of your heart-rate reserve. Add your age and weight under Body Profile for a sharper threshold and calorie estimates.")
                 .font(WH.Font.caption)
                 .foregroundStyle(WH.Color.textSecondary)
                 .multilineTextAlignment(.center)

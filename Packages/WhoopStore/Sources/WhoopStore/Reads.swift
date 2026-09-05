@@ -14,12 +14,19 @@ extension WhoopStore {
         }
     }
 
+    /// R-R intervals in RECORDING order.
+    ///
+    /// The secondary sort is `rowid` (insertion order), NOT `rrMs`. Sorting several beats that
+    /// share a timestamp by their length would hand HRV (RMSSD) and the stress index a sequence
+    /// that rises monotonically inside every second — an artefact of the sort, not of the heart —
+    /// which shrinks successive differences and therefore understates HRV. rowid preserves the
+    /// order the beats actually arrived in.
     public func rrIntervals(deviceId: String, from: Int, to: Int, limit: Int) async throws -> [RRInterval] {
         try syncRead { db in
             try Row.fetchAll(db, sql: """
                 SELECT ts, rrMs FROM rrInterval
                 WHERE deviceId = ? AND ts >= ? AND ts <= ?
-                ORDER BY ts ASC, rrMs ASC LIMIT ?
+                ORDER BY ts ASC, rowid ASC LIMIT ?
                 """, arguments: [deviceId, from, to, limit])
                 .map { RRInterval(ts: $0["ts"], rrMs: $0["rrMs"]) }
         }
@@ -103,6 +110,24 @@ extension WhoopStore {
         try syncRead { db in
             try Int.fetchOne(db,
                 sql: "SELECT MAX(ts) FROM hrSample WHERE deviceId = ?", arguments: [deviceId])
+        }
+    }
+
+    /// How many MINUTES of each UTC day actually carry a heart-rate sample.
+    ///
+    /// Counts distinct minute buckets rather than rows, so a dense live stream and a sparse
+    /// historical offload are measured on the same scale: this answers "how much of that day did
+    /// the strap really cover", which is what decides whether a night or a workout can be
+    /// detected at all. Returns `(dayStartEpoch, coveredMinutes)` pairs, oldest first.
+    public func hrCoverageByDay(deviceId: String, from: Int, to: Int) async throws -> [(dayStart: Int, minutes: Int)] {
+        try syncRead { db in
+            try Row.fetchAll(db, sql: """
+                SELECT (ts / 86400) * 86400 AS dayStart, COUNT(DISTINCT ts / 60) AS mins
+                FROM hrSample
+                WHERE deviceId = ? AND ts >= ? AND ts <= ?
+                GROUP BY dayStart ORDER BY dayStart ASC
+                """, arguments: [deviceId, from, to])
+                .map { (dayStart: $0["dayStart"], minutes: $0["mins"]) }
         }
     }
 

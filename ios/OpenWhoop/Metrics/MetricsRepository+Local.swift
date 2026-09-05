@@ -28,14 +28,29 @@ struct TrackingDiagnosticItem: Identifiable {
     let detail: String
 }
 
+/// How much of one day actually carries data. This is the number that decides whether a night or
+/// a workout can be found at all, so it is worth showing plainly instead of leaving the user to
+/// infer it from a metric that silently stayed empty.
+struct DayCoverage: Identifiable {
+    let dayStart: Int
+    let minutes: Int
+    var id: Int { dayStart }
+    /// 0...1 of a 24 h day.
+    var fraction: Double { min(1.0, Double(minutes) / (24 * 60)) }
+    var date: Date { Date(timeIntervalSince1970: TimeInterval(dayStart)) }
+}
+
 /// Snapshot of what the app can currently track.
 struct TrackingDiagnostics {
     var serverConfigured: Bool = false
     var totalStoredRows: Int = 0
     var latestSample: Date?
     var nightsComputed: Int = 0
+    var workoutsDetected: Int = 0
     var rawStreams: [TrackingDiagnosticItem] = []
     var metrics: [TrackingDiagnosticItem] = []
+    /// Last 7 days, oldest first — days with no data at all are included as zero.
+    var coverage: [DayCoverage] = []
 }
 
 extension MetricsRepository {
@@ -83,6 +98,73 @@ extension MetricsRepository {
 
         _ = try? await store.upsertSleepSessions(sessions, deviceId: deviceId)
         _ = try? await store.upsertDailyMetrics(dailies, deviceId: deviceId)
+    }
+
+    // MARK: - Stress history (Today → Stress tile → StressDetailView)
+
+    /// Stress index over time, computed on demand from the stored R-R intervals.
+    ///
+    /// Nothing is cached: the whole series for a day is a few hundred bins over a few tens of
+    /// thousands of beats, which is fast enough to recompute on every open, and recomputing means
+    /// the chart automatically includes beats that arrived from a backfill seconds ago and never
+    /// goes stale against the raw data.
+    func stressSeries(fromEpoch: Int, toEpoch: Int,
+                      binSeconds: Int = StressHistory.defaultBinSeconds) async -> [StressPoint] {
+        await ensureOpen()
+        guard let store else { return [] }
+        let rr = (try? await store.rrIntervals(deviceId: deviceId, from: fromEpoch, to: toEpoch,
+                                               limit: 500_000)) ?? []
+        return StressHistory.series(rr: rr, binSeconds: binSeconds)
+    }
+
+    // MARK: - Local workout detection (Workouts tab without a server)
+
+    /// Detects workout bouts on-device from the stored heart-rate stream.
+    ///
+    /// Resting HR comes from the most recent computed night so the intensity threshold is scaled
+    /// to the person rather than to a population average; age and weight come from the local Body
+    /// Profile, which also unlocks the calorie estimate.
+    func localWorkouts(fromEpoch: Int, toEpoch: Int) async -> [Workout] {
+        await ensureOpen()
+        guard let store else { return [] }
+        let hr = (try? await store.hrSamples(deviceId: deviceId, from: fromEpoch, to: toEpoch,
+                                             limit: 250_000)) ?? []
+        guard hr.count >= 30 else { return [] }
+
+        // Resting HR: prefer a recently measured night, else let the detector use its fallback.
+        let recentNight = (try? await store.sleepSessions(deviceId: deviceId,
+                                                          from: toEpoch - 14 * 86_400,
+                                                          to: toEpoch + 86_400,
+                                                          limit: 30))?.last
+        let profile = ProfileStorage.load()
+
+        return WorkoutDetector.detect(hr: hr,
+                                      deviceId: deviceId,
+                                      restingHr: recentNight?.restingHr ?? today?.restingHr,
+                                      age: profile?.age,
+                                      weightKg: profile?.weightKg,
+                                      sex: profile?.sex)
+    }
+
+    // MARK: - Backup (Settings → Daten sichern)
+
+    /// Writes a full backup file and returns its URL for the share sheet. See BackupService.
+    func exportBackup() async throws -> URL {
+        await ensureOpen()
+        guard let store else { throw BackupService.Failure.unreadable }
+        return try await BackupService.export(store: store, deviceId: deviceId)
+    }
+
+    /// Merges a backup file into the local database and refreshes the derived metrics from it,
+    /// so restored nights show up immediately instead of after the next sync.
+    @discardableResult
+    func restoreBackup(from url: URL) async throws -> BackupService.Counts {
+        await ensureOpen()
+        guard let store else { throw BackupService.Failure.unreadable }
+        let counts = try await BackupService.restore(from: url, store: store, deviceId: deviceId)
+        await computeLocalMetrics()
+        await load()
+        return counts
     }
 
     // MARK: - Tracking diagnostics (Settings → "Was wird getrackt?")
@@ -143,6 +225,20 @@ extension MetricsRepository {
         out.nightsComputed = nights.count
         let latest = nights.last?.daily
 
+        // Coverage: how many minutes of each of the last 7 days carry a heart-rate sample. Zero-
+        // filled so a day the strap wasn't worn is visible as an empty bar rather than missing.
+        let measured = (try? await store.hrCoverageByDay(deviceId: deviceId,
+                                                         from: weekAgo, to: now)) ?? []
+        let byDay = Dictionary(measured.map { ($0.dayStart, $0.minutes) },
+                               uniquingKeysWith: { a, _ in a })
+        let todayStart = (now / 86_400) * 86_400
+        out.coverage = (0..<7).reversed().map { back in
+            let dayStart = todayStart - back * 86_400
+            return DayCoverage(dayStart: dayStart, minutes: byDay[dayStart] ?? 0)
+        }
+
+        out.workoutsDetected = await localWorkouts(fromEpoch: weekAgo, toEpoch: now).count
+
         func metricItem(_ id: String, _ name: String, _ value: Double?, _ formatted: String,
                         missingHint: String) -> TrackingDiagnosticItem {
             if let value, value.isFinite {
@@ -157,6 +253,20 @@ extension MetricsRepository {
         let hrv = latest?.avgHrv
         let rec = latest?.recovery
         let strain = latest?.strain
+
+        // Stress is no longer live-only: it is recomputed per 5-minute window from the stored
+        // R-R intervals, so the diagnostics can report its real 24 h coverage like any other
+        // derived metric.
+        let stressPoints = StressHistory.series(rr: rrAll.filter { $0.ts >= now - 86_400 })
+        let stressAvg = stressPoints.isEmpty ? 0
+            : stressPoints.map(\.index).reduce(0, +) / Double(stressPoints.count)
+        let stressItem = TrackingDiagnosticItem(
+            id: "stress",
+            name: "Stress-Verlauf (24 h)",
+            status: stressPoints.isEmpty ? .missing : (stressPoints.count < 12 ? .partial : .ok),
+            detail: stressPoints.isEmpty
+                ? "Zu wenige R-R-Intervalle"
+                : "\(stressPoints.count) Messfenster · Ø \(Int(stressAvg.rounded()))")
 
         out.metrics = [
             metricItem("sleep", "Schlafdauer", sleepMin, sleepText,
@@ -174,6 +284,7 @@ extension MetricsRepository {
             metricItem("strain", "Strain (Schätzung)", strain,
                        strain.map { String(format: "%.1f / 21", $0) } ?? "",
                        missingHint: "Zu wenige Messwerte am Tag"),
+            stressItem,
             TrackingDiagnosticItem(id: "stages", name: "Schlafphasen (Tief/REM)", status: .missing,
                            detail: "Nicht berechenbar — das Band sendet die nötigen Signale nicht"),
             TrackingDiagnosticItem(id: "spo2pct", name: "SpO2 in Prozent", status: .missing,
