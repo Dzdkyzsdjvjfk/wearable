@@ -113,7 +113,7 @@ final class WorkoutDetectorTests: XCTestCase {
         // 150 bpm of a 190 max is 79 % → zone 3 (70–80 %).
         let bins = [(ts: 0, bpm: 150.0)]
         let dist = WorkoutDetector.zoneDistribution(bins: bins, maxHR: 190)
-        XCTAssertEqual(dist[3], 100, accuracy: 0.01)
+        XCTAssertEqual(dist[3] ?? 0, 100, accuracy: 0.01)
     }
 
     // MARK: - Calories

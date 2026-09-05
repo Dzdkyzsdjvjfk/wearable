@@ -31,8 +31,8 @@ final class StressHistoryTests: XCTestCase {
     }
 
     func testProducesOnePointPerWellFilledBin() {
-        // ~60 beats per 5-min bin over 3 bins.
-        let rr = beats(from: 1_000_000, count: 3 * 60) { i in 800 + (i % 7) * 20 }
+        // ~1200 beats at ~0.85 s each ≈ 17 minutes, i.e. several 5-minute bins.
+        let rr = beats(from: 1_000_000, count: 1_200) { i in 800 + (i % 7) * 20 }
         let series = StressHistory.series(rr: rr, binSeconds: 300)
         XCTAssertGreaterThanOrEqual(series.count, 2)
         // Bin starts must be aligned to the bin width and strictly increasing.
@@ -53,7 +53,9 @@ final class StressHistoryTests: XCTestCase {
 
     func testLowVariabilityScoresHigherStressThanHighVariability() {
         // The whole point of the index: a flat, rigid rhythm = sympathetic dominance = high SI.
-        let rigid = beats(from: 2_000_000, count: 120) { i in 800 + (i % 2) * 10 }
+        // Note both series must still have SOME spread: a perfectly flat window is rejected by
+        // the formula's divide-by-near-zero guard rather than scored as infinitely stressed.
+        let rigid = beats(from: 2_000_000, count: 120) { i in 800 + (i % 3) * 20 }
         let variable = beats(from: 3_000_000, count: 120) { i in 700 + (i % 11) * 40 }
         let rigidIdx = StressHistory.series(rr: rigid).map(\.index).max() ?? 0
         let variableIdx = StressHistory.series(rr: variable).map(\.index).max() ?? 0
@@ -62,7 +64,7 @@ final class StressHistoryTests: XCTestCase {
 
     func testArtefactsAreFilteredBeforeBinning() {
         // Implausible intervals (<300 ms / >2000 ms) must not reach the formula.
-        var rr = beats(from: 4_000_000, count: 60) { _ in 900 }
+        var rr = beats(from: 4_000_000, count: 60) { i in 880 + (i % 5) * 20 }
         rr.append(RRInterval(ts: 4_000_010, rrMs: 12))
         rr.append(RRInterval(ts: 4_000_011, rrMs: 9_000))
         let clean = StressHistory.series(rr: rr)
