@@ -36,6 +36,12 @@ public final class LiveViewModel: ObservableObject {
     /// notified when a property of `live.state` changes. Views that want to react to "a sync just
     /// finished" — Today recomputes and reloads on it — must observe this, not `live.state`.
     @Published public private(set) var lastSyncedAt: TimeInterval?
+
+    /// Mirror of LiveState.connected, republished here for the same reason as `lastSyncedAt`:
+    /// views holding `@EnvironmentObject live` are not notified about changes inside `live.state`,
+    /// so anything that must REACT to connecting/disconnecting (rather than merely read the flag
+    /// while rendering) has to observe this.
+    @Published public private(set) var connected: Bool = false
     public let hrHistoryWindowMinutes: Double = 15
     private let hrHistoryMaxPoints = 900   // safety cap regardless of the time window
 
@@ -66,7 +72,9 @@ public final class LiveViewModel: ObservableObject {
         // than showing a stale number or a "Live" chart that's no longer receiving anything.
         s.$connected
             .sink { [weak self] connected in
-                guard let self, !connected else { return }
+                guard let self else { return }
+                self.connected = connected
+                guard !connected else { return }
                 self.stressBuffer.removeAll()
                 self.stressIndex = nil
                 self.hrHistory.removeAll()

@@ -33,6 +33,9 @@ struct TodayView: View {
     /// to a dash the moment the live stream stopped.
     @State private var recentStress: StressPoint?
 
+    /// Stored heart-rate samples backing the chart below the tiles (see hrChartSeries).
+    @State private var storedHR: [TrendPoint] = []
+
     var body: some View {
         NavigationStack {
             ZStack {
@@ -51,12 +54,17 @@ struct TodayView: View {
             .toolbar(.hidden, for: .navigationBar)
         }
         .preferredColorScheme(.dark)
-        .task { await metrics.refresh(); await loadRecentStress() }
-        .refreshable { await metrics.refresh(); await loadRecentStress() }
+        .task { await metrics.refresh(); await loadRecentStress(); await loadStoredHR() }
+        .refreshable { await metrics.refresh(); await loadRecentStress(); await loadStoredHR() }
         // A completed strap sync writes new rows; recompute and reload right away so the screen
         // reflects the data the moment it lands instead of on the next manual pull-to-refresh.
         .onChange(of: live.lastSyncedAt) { _ in
-            Task { await metrics.refresh(); await loadRecentStress() }
+            Task { await metrics.refresh(); await loadRecentStress(); await loadStoredHR() }
+        }
+        // Reconnecting empties the live buffer, so pull the stored curve back in immediately
+        // instead of leaving the chart blank until enough new readings have arrived.
+        .onChange(of: live.connected) { _ in
+            Task { await loadStoredHR(); await loadRecentStress() }
         }
         .sheet(isPresented: $showJournal) {
             JournalEntryView(day: JournalStore.dayString(), dayLabel: "Today", journal: journal)
@@ -485,8 +493,8 @@ struct TodayView: View {
             .accessibilityElement(children: .combine)
             .accessibilityLabel(hrChartAccessibilityLabel)
 
-            if live.hrHistory.count >= 2 {
-                MetricChart(series: live.hrHistory,
+            if hrChartSeries.count >= 2 {
+                MetricChart(series: hrChartSeries,
                            kind: .rawHR,
                            showAxes: true,
                            showSelection: true,
@@ -494,7 +502,9 @@ struct TodayView: View {
                            selected: $hrChartSelected)
                     .frame(height: 140)
 
-                Text("Live · last \(Int(live.hrHistoryWindowMinutes)) min")
+                Text(live.connected
+                     ? "Live · last \(hrChartWindowMinutes) min"
+                     : "Recorded · last \(hrChartWindowMinutes) min")
                     .font(WH.Font.caption)
                     .foregroundStyle(WH.Color.textSecondary.opacity(0.6))
             } else {
@@ -504,7 +514,7 @@ struct TodayView: View {
                         Image(systemName: "waveform.path.ecg")
                             .font(.system(size: 22, weight: .light))
                             .foregroundStyle(WH.Color.textSecondary.opacity(0.5))
-                        Text("Connect your strap (Device tab) to see a live chart")
+                        Text("No heart rate in the last hour. Wear the strap, or sync it from the Device tab.")
                             .font(WH.Font.caption)
                             .foregroundStyle(WH.Color.textSecondary)
                             .multilineTextAlignment(.center)
@@ -519,10 +529,38 @@ struct TodayView: View {
                     in: RoundedRectangle(cornerRadius: WH.Radius.card, style: .continuous))
     }
 
+    /// How far back the heart-rate card looks. Longer than the live-only buffer because most of
+    /// the curve now comes from stored samples, not from this session's readings.
+    private var hrChartWindowMinutes: Int { 60 }
+
+    /// What the chart actually plots: stored samples first, then this session's live readings.
+    ///
+    /// Merging the two is what fixes an empty chart right after connecting — the live buffer
+    /// starts from scratch on every connect, while the database already holds the last hour. Both
+    /// are keyed by second, so a reading present in both is kept once and the live copy wins.
+    private var hrChartSeries: [TrendPoint] {
+        let cutoff = Date().addingTimeInterval(-Double(hrChartWindowMinutes) * 60)
+        var bySecond: [Int: TrendPoint] = [:]
+        for p in storedHR where p.date >= cutoff {
+            bySecond[Int(p.date.timeIntervalSince1970)] = p
+        }
+        for p in live.hrHistory where p.date >= cutoff {
+            bySecond[Int(p.date.timeIntervalSince1970)] = p
+        }
+        return bySecond.keys.sorted().compactMap { bySecond[$0] }
+    }
+
+    /// Loads the stored part of the chart. Cheap enough to redo whenever the screen appears, a
+    /// sync lands, or the strap (re)connects.
+    private func loadStoredHR() async {
+        storedHR = await metrics.recentHRPoints(minutes: hrChartWindowMinutes)
+    }
+
     private var hrChartAccessibilityLabel: String {
-        guard live.hrHistory.count >= 2 else { return "Heart rate chart, no live data yet" }
-        let latest = Int(live.hrHistory.last?.value.rounded() ?? 0)
-        return "Heart rate chart, latest \(latest) beats per minute, live over the last \(Int(live.hrHistoryWindowMinutes)) minutes"
+        let series = hrChartSeries
+        guard series.count >= 2 else { return "Heart rate chart, no data yet" }
+        let latest = Int(series.last?.value.rounded() ?? 0)
+        return "Heart rate chart, latest \(latest) beats per minute, over the last \(hrChartWindowMinutes) minutes"
     }
 
     // MARK: - Empty state

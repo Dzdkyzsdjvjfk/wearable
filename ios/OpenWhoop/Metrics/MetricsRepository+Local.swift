@@ -117,6 +117,27 @@ extension MetricsRepository {
         return StressHistory.series(rr: rr, binSeconds: binSeconds)
     }
 
+    // MARK: - Stored heart-rate series (seeds the Today chart)
+
+    /// Recent heart-rate samples from the LOCAL database as chart points, newest last.
+    ///
+    /// The Today chart used to plot only readings that arrived since the app connected, so it sat
+    /// empty for the first minutes of every connection — and showed nothing at all for a strap
+    /// that had just been synced. Seeding it from stored rows means the chart is populated the
+    /// moment the screen opens, and the live stream simply extends it.
+    func recentHRPoints(minutes: Int = 60) async -> [TrendPoint] {
+        await ensureOpen()
+        guard let store else { return [] }
+        let now = Int(Date().timeIntervalSince1970)
+        let rows = (try? await store.hrSamples(deviceId: deviceId, from: now - minutes * 60,
+                                               to: now, limit: 20_000)) ?? []
+        return rows.map {
+            TrendPoint(id: "s\($0.ts)",
+                       date: Date(timeIntervalSince1970: TimeInterval($0.ts)),
+                       value: Double($0.bpm))
+        }
+    }
+
     // MARK: - Local workout detection (Workouts tab without a server)
 
     /// Detects workout bouts on-device from the stored heart-rate stream.
