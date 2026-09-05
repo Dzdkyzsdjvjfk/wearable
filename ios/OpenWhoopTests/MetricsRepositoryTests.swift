@@ -12,11 +12,17 @@ final class MetricsRepositoryTests: XCTestCase {
     }
 
     private func seedDaily(_ store: WhoopStore) async throws -> [DailyMetric] {
+        // Days RELATIVE to now, like seedSleep below. load() only reads the last 14 days, so the
+        // hard-coded dates that used to sit here quietly aged out of that window — the tests had
+        // been failing on the calendar alone. Nothing ran them, so nobody noticed.
+        let now = Int(Date().timeIntervalSince1970)
         let days = [
-            DailyMetric(day: "2026-05-20", totalSleepMin: 400, efficiency: 0.85,
+            DailyMetric(day: LocalMetricsEngine.dayString(forEpoch: now - 2 * 86_400),
+                        totalSleepMin: 400, efficiency: 0.85,
                         deepMin: 80, remMin: 100, lightMin: 220, disturbances: 2,
                         restingHr: 55, avgHrv: 58, recovery: 0.62, strain: 10, exerciseCount: 1),
-            DailyMetric(day: "2026-05-21", totalSleepMin: 430, efficiency: 0.90,
+            DailyMetric(day: LocalMetricsEngine.dayString(forEpoch: now - 1 * 86_400),
+                        totalSleepMin: 430, efficiency: 0.90,
                         deepMin: 90, remMin: 110, lightMin: 230, disturbances: 1,
                         restingHr: 52, avgHrv: 65, recovery: 0.75, strain: 12, exerciseCount: 0),
         ]
@@ -76,12 +82,14 @@ final class MetricsRepositoryTests: XCTestCase {
         let repo = makeRepo(store: store)
         let days = try await seedDaily(store)
 
+        // Bounds derived from the seeded rows themselves, so the test does not depend on what
+        // today's date happens to be.
         // Full window — should get both rows.
-        let all = await repo.daily(fromDay: "2026-05-01", toDay: "2026-05-31")
+        let all = await repo.daily(fromDay: days[0].day, toDay: days[1].day)
         XCTAssertEqual(all, days)
 
         // Narrow window — should get only the later row.
-        let narrow = await repo.daily(fromDay: "2026-05-21", toDay: "2026-05-31")
+        let narrow = await repo.daily(fromDay: days[1].day, toDay: days[1].day)
         XCTAssertEqual(narrow, [days[1]])
     }
 
@@ -90,7 +98,10 @@ final class MetricsRepositoryTests: XCTestCase {
         let repo = makeRepo(store: store)
         _ = try await seedDaily(store)
 
-        let result = await repo.daily(fromDay: "2026-01-01", toDay: "2026-01-31")
+        // A window well before the seeded days, expressed relatively so it stays "before" forever.
+        let now = Int(Date().timeIntervalSince1970)
+        let result = await repo.daily(fromDay: LocalMetricsEngine.dayString(forEpoch: now - 400 * 86_400),
+                                      toDay: LocalMetricsEngine.dayString(forEpoch: now - 390 * 86_400))
         XCTAssertTrue(result.isEmpty)
     }
 
