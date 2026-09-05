@@ -150,9 +150,14 @@ enum SleepStaging {
         let hrFloor = percentile(hrPerEpoch, 0.05) ?? hrPerEpoch.min() ?? 0
         let hrCeiling = percentile(hrPerEpoch, 0.95) ?? hrPerEpoch.max() ?? 0
         let hrSpan = max(1.0, hrCeiling - hrFloor)
-        let activeMotion = activity.filter { $0 > 0 }
+        // Movement threshold, relative to how much this night moved at all. A fraction of the
+        // night's own high-water mark works on both ends: on a restless night the tossing clears
+        // it, and on a still night the 95th percentile is ~0 so the small absolute floor keeps
+        // sensor noise from being scored as getting up. (An earlier version took a percentile of
+        // only the non-zero epochs and scaled it UP, which could land above the night's own
+        // maximum activity — and then nothing ever cleared it.)
         let motionThreshold = usedMotion
-            ? max(0.02, (percentile(activeMotion, 0.75) ?? 0.05) * 1.2)
+            ? max(0.015, (percentile(activity, 0.95) ?? 0) * 0.35)
             : Double.greatestFiniteMagnitude
         let rmssdValues = rmssd.compactMap { $0 }
         let rmssdHigh = percentile(rmssdValues, 0.60)
