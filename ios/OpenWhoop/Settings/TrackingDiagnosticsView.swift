@@ -107,6 +107,8 @@ struct TrackingDiagnosticsView: View {
 
                 coverageCard(d)
 
+                clockCard(d)
+
                 section(title: "SIGNALE VOM BAND",
                         subtitle: "Kommt per Bluetooth an und liegt lokal auf dem iPhone.",
                         items: d.rawStreams)
@@ -229,6 +231,45 @@ struct TrackingDiagnosticsView: View {
                 .font(.system(size: 11))
                 .foregroundStyle(WH.Color.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(WH.Spacing.md)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(WH.Color.surface,
+                    in: RoundedRectangle(cornerRadius: WH.Radius.card, style: .continuous))
+    }
+
+    // MARK: - Strap clock quality
+    //
+    // Answers the question the sentinel/backfill fixes raised but never showed: is the strap's own
+    // clock currently trusted as-is, or is the app quietly shifting its historical timestamps to
+    // compensate for a wrong RTC — and how sure is that correction (an exact GET_CLOCK reading vs.
+    // an estimate from the newest stored record)?
+
+    private func clockCard(_ d: TrackingDiagnostics) -> some View {
+        VStack(alignment: .leading, spacing: WH.Spacing.sm) {
+            Text("ARMBAND-UHR")
+                .font(WH.Font.cardTitle)
+                .foregroundStyle(WH.Color.textSecondary)
+                .tracking(1.2)
+
+            if let offset = d.strapClockOffsetSeconds {
+                let days = abs(offset) / 86_400
+                let hours = (abs(offset) % 86_400) / 3600
+                let direction = offset > 0 ? "voraus" : "nach"
+                var magnitude = ""
+                if days > 0 { magnitude += "\(days) Tag\(days == 1 ? "" : "e") " }
+                magnitude += "\(hours) Std."
+
+                summaryRow("Abweichung", "\(magnitude) \(direction)")
+                summaryRow("Quelle", d.strapClockSource == "GET_CLOCK" ? "exakt gemessen" : "geschätzt")
+                summaryRow("Zuletzt gemessen", relativeText(d.strapClockMeasuredAt))
+                Text("Historische Zeitstempel vom Band werden um diesen Betrag korrigiert, solange sich die Abweichung nicht ändert.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(WH.Color.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                summaryRow("Abweichung", "keine — Uhr synchron")
+            }
         }
         .padding(WH.Spacing.md)
         .frame(maxWidth: .infinity, alignment: .leading)

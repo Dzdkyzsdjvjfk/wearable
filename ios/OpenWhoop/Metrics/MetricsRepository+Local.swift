@@ -51,6 +51,14 @@ struct TrackingDiagnostics {
     var metrics: [TrackingDiagnosticItem] = []
     /// Last 7 days, oldest first — days with no data at all are included as zero.
     var coverage: [DayCoverage] = []
+
+    // Strap clock quality — see AppSettings.recordStrapClock / BLEManager.noteStrapClock.
+    /// Last measured (strap RTC − phone wall clock) in seconds; nil if the strap's clock has never
+    /// been measured far enough off to need correcting.
+    var strapClockOffsetSeconds: Int?
+    /// "GET_CLOCK" (exact reading) or "GET_DATA_RANGE" (estimated from its newest record).
+    var strapClockSource: String?
+    var strapClockMeasuredAt: Date?
 }
 
 extension MetricsRepository {
@@ -201,6 +209,9 @@ extension MetricsRepository {
         await ensureOpen()
         var out = TrackingDiagnostics()
         out.serverConfigured = serverSync != nil
+        out.strapClockOffsetSeconds = AppSettings.strapClockOffsetSeconds
+        out.strapClockSource = AppSettings.strapClockSource
+        out.strapClockMeasuredAt = AppSettings.strapClockMeasuredAt
         guard let store else { return out }
 
         let now = Int(Date().timeIntervalSince1970)

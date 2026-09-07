@@ -26,4 +26,40 @@ enum AppSettings {
         }
         set { UserDefaults.standard.set(newValue, forKey: highDensityKey) }
     }
+
+    // MARK: - Strap clock quality (last measured GET_CLOCK/GET_DATA_RANGE offset)
+    //
+    // BLEManager measures this live during a connect but keeps it only in memory (on the
+    // Backfiller), so the Settings screen had nothing to show once the strap disconnected again.
+    // Persisting the last measurement here lets "Was wird getrackt?" answer "is the strap's clock
+    // being corrected right now, and by how much" even hours after the connection that measured it.
+
+    private static let clockOffsetKey = "com.openwhoop.strapClock.offsetSeconds"
+    private static let clockSourceKey = "com.openwhoop.strapClock.source"
+    private static let clockMeasuredAtKey = "com.openwhoop.strapClock.measuredAt"
+
+    /// Last measured (strap RTC − phone wall clock) in seconds; nil before any connect has
+    /// measured a drift at or above `Backfiller.clockRepairThreshold`.
+    static var strapClockOffsetSeconds: Int? {
+        UserDefaults.standard.object(forKey: clockOffsetKey) as? Int
+    }
+
+    /// "GET_CLOCK" (authoritative) or "GET_DATA_RANGE" (fallback proxy) — whichever produced the
+    /// stored offset above.
+    static var strapClockSource: String? {
+        UserDefaults.standard.string(forKey: clockSourceKey)
+    }
+
+    /// When the stored offset was measured (wall clock at that connect).
+    static var strapClockMeasuredAt: Date? {
+        let ts = UserDefaults.standard.double(forKey: clockMeasuredAtKey)
+        return ts > 0 ? Date(timeIntervalSince1970: ts) : nil
+    }
+
+    static func recordStrapClock(offsetSeconds: Int, source: String) {
+        let d = UserDefaults.standard
+        d.set(offsetSeconds, forKey: clockOffsetKey)
+        d.set(source, forKey: clockSourceKey)
+        d.set(Date().timeIntervalSince1970, forKey: clockMeasuredAtKey)
+    }
 }

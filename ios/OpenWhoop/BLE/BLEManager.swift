@@ -875,6 +875,7 @@ extension BLEManager: CBPeripheralDelegate {
         if source == "GET_CLOCK" { strapClockFromGetClock = true }
         guard backfiller?.strapClockOffset != offset else { return }
         backfiller?.strapClockOffset = offset
+        AppSettings.recordStrapClock(offsetSeconds: offset, source: source)
         log(String(format: "Strap-Uhr geht um %.1f Tage falsch (%@, Strap sagt %@) — Zeitstempel der Historie werden korrigiert",
                    Double(offset) / 86_400.0, source, BLEManager.isoDay(strapUnix)))
     }
