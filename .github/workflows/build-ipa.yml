@@ -67,6 +67,9 @@ jobs:
           xcodegen generate
 
       - name: Build unsigned .app for iOS device
+        # CURRENT_PROJECT_VERSION is set to the CI run number here, overriding project.yml's static
+        # "1" — without this every sideload shows the same build number and there is no way to tell
+        # from the phone alone whether a new IPA actually installed.
         run: |
           cd ios
           xcodebuild \
@@ -78,6 +81,7 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
+            CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" \
             build
 
       - name: Package as .ipa (unsigned)

@@ -15,9 +15,20 @@ import SwiftUI
 
 struct TrackingDiagnosticsView: View {
     @EnvironmentObject private var metrics: MetricsRepository
+    @EnvironmentObject private var live: LiveViewModel
 
     @State private var diag: TrackingDiagnostics?
     @State private var isLoading = true
+    @State private var refreshState: RefreshState = .idle
+
+    /// What "Jetzt aktualisieren" reports back. This is the whole point of the button: a tap
+    /// either ends in fresh data showing up below, or in an explicit, specific reason it didn't —
+    /// never a silent no-op that leaves Julian guessing whether anything happened at all.
+    private enum RefreshState: Equatable {
+        case idle
+        case syncing
+        case done(String)
+    }
 
     var body: some View {
         ZStack {
@@ -41,6 +52,37 @@ struct TrackingDiagnosticsView: View {
         isLoading = false
     }
 
+    /// Kicks a manual offload (bypasses the rate-limiter entirely — see BackfillPolicy.manual) when
+    /// the strap is connected, then recomputes from whatever landed. Not connected → recompute only,
+    /// said plainly, rather than pretending a sync happened.
+    private func refreshTapped() {
+        guard refreshState != .syncing else { return }
+        Task {
+            refreshState = .syncing
+            if live.connected {
+                live.syncNow()
+                // The offload itself is async and BLE-paced (chunk → ack → next chunk); this is a
+                // fixed budget to let a short session land before we read the store, not a promise
+                // that every round finished. The per-metric reasons below stay honest either way.
+                try? await Task.sleep(nanoseconds: 4_000_000_000)
+            }
+            let before = diag
+            await reload()
+            refreshState = .done(refreshSummary(before: before, after: diag))
+        }
+    }
+
+    /// The one line Julian asked for: either "N neue Messwerte" or an explicit reason nothing
+    /// changed — never just a spinner that quietly stops.
+    private func refreshSummary(before: TrackingDiagnostics?, after: TrackingDiagnostics?) -> String {
+        guard let after else { return "Fehler: Diagnose konnte nicht geladen werden" }
+        guard live.connected else { return "Nicht verbunden — zeige gespeicherte Daten" }
+        let delta = after.totalStoredRows - (before?.totalStoredRows ?? after.totalStoredRows)
+        if delta > 0 { return "\(delta) neue Messwerte übertragen" }
+        if after.nightsComputed > 0 { return "Keine neuen Messwerte — letzte Nacht bereits ausgewertet" }
+        return "Keine neuen Daten gefunden (Whoop meldet nichts Neues seit dem letzten Sync)"
+    }
+
     // MARK: - Loading
 
     private var loadingView: some View {
@@ -58,6 +100,8 @@ struct TrackingDiagnosticsView: View {
     private func content(_ d: TrackingDiagnostics) -> some View {
         ScrollView {
             VStack(alignment: .leading, spacing: WH.Spacing.lg) {
+
+                refreshCard
 
                 summaryCard(d)
 
@@ -77,6 +121,47 @@ struct TrackingDiagnosticsView: View {
             }
             .padding(WH.Spacing.md)
         }
+    }
+
+    // MARK: - Refresh
+    //
+    // The button Julian asked for: pull fresh data now, and say — in one line — either what
+    // landed or exactly why nothing did. "Was wird getrackt?" already computes a specific reason
+    // per metric (see below); this reuses that rather than inventing a second reporting path.
+
+    private var refreshCard: some View {
+        VStack(alignment: .leading, spacing: WH.Spacing.sm) {
+            Button(action: refreshTapped) {
+                HStack {
+                    if refreshState == .syncing {
+                        ProgressView().tint(.white)
+                    } else {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    Text(refreshState == .syncing ? "Synchronisiere…" : "Jetzt aktualisieren")
+                        .font(.headline)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, WH.Spacing.sm)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(WH.Color.teal)
+            .disabled(refreshState == .syncing)
+
+            if case .done(let text) = refreshState {
+                Text(text)
+                    .font(WH.Font.caption)
+                    .foregroundStyle(WH.Color.textSecondary)
+            } else if !live.connected {
+                Text("Whoop nicht verbunden — zeigt vorerst nur gespeicherte Daten.")
+                    .font(WH.Font.caption)
+                    .foregroundStyle(WH.Color.textSecondary)
+            }
+        }
+        .padding(WH.Spacing.md)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(WH.Color.surface,
+                    in: RoundedRectangle(cornerRadius: WH.Radius.card, style: .continuous))
     }
 
     // MARK: - Summary

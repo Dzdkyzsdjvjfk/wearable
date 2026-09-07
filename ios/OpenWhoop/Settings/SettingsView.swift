@@ -154,6 +154,7 @@ struct SettingsView: View {
                 captureSection
                 backupSection
                 diagnosticsSection
+                versionSection
                 footerSection
             }
             .scrollContentBackground(.hidden)
@@ -409,6 +410,21 @@ struct SettingsView: View {
             backupStatus = "\(counts.totalRows) Messwerte ergänzt · \(counts.sleepSessions) Nächte"
         } catch {
             backupStatus = error.localizedDescription
+        }
+    }
+
+    /// So Julian can confirm from the phone alone that a sideload actually landed — no cable,
+    /// no Xcode, just this screen. Both fields come straight from the app's own Info.plist.
+    private var versionSection: some View {
+        Section {
+            HStack {
+                Text("Version")
+                Spacer()
+                Text(AppVersion.displayString)
+                    .foregroundStyle(WH.Color.textSecondary)
+            }
+        } header: {
+            Text("APP")
         }
     }
 
