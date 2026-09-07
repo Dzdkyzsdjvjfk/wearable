@@ -80,6 +80,9 @@ public final class BLEManager: NSObject, ObservableObject {
     static let maxDrainSeconds: TimeInterval = 900
     /// Wall clock when the current drain began, for that budget.
     private var backfillDrainStartedAt: TimeInterval = 0
+    /// True once a genuine GET_CLOCK reply has set the strap-clock offset, so the coarser
+    /// GET_DATA_RANGE estimate stops overwriting it.
+    private var strapClockFromGetClock = false
     /// Runs the connect handshake EXACTLY ONCE per connection. `didWriteValueFor` re-fires on every
     /// `.withResponse` write (the bond write, every SEND_HISTORICAL, every HISTORY_END ack); without
     /// this guard those re-entries re-blasted hello/SET_CLOCK at the strap mid-offload and stopped it
@@ -819,13 +822,12 @@ extension BLEManager: CBPeripheralDelegate {
         // GET_CLOCK goes FIRST, before SET_CLOCK overwrites the evidence. Writes are serialised, so
         // the reply carries the RTC the strap kept while it was recording alone — the only chance to
         // measure how wrong it was, and therefore the only way to rescue a backlog it mis-stamped.
-        if clockRef == nil && !clockRequested {
-            clockRequested = true
-            send(.getClock, payload: [])   // the strap expects GET_CLOCK with an EMPTY payload;
+        // Asked on EVERY connect, not just the first: the correlation may survive in memory from an
+        // earlier connect while the strap's own clock has since been lost, and the strap's clock is
+        // what the historical timestamps are written in.
+        clockRequested = true
+        send(.getClock, payload: [])       // the strap expects GET_CLOCK with an EMPTY payload;
                                            // the app's old default [0x00] is a wrong length the strap ignores.
-                                           // (Offload no longer depends on this — Backfiller falls back to an
-                                           // identity clockRef — but a real correlation helps realtime decode.)
-        }
         send(.setClock, payload: BLEManager.setClockPayload())
         send(.sendR10R11Realtime, payload: [0x00])   // stop the type-43 realtime flood (BLE airtime/battery)
         // Type-40 REALTIME_DATA: ~1 Hz heart rate WITH R-R intervals, which is the only dense
@@ -866,7 +868,11 @@ extension BLEManager: CBPeripheralDelegate {
     private func noteStrapClock(_ strapUnix: Int, source: String) {
         let offset = strapUnix - Int(Date().timeIntervalSince1970)
         guard abs(offset) >= Backfiller.clockRepairThreshold else { return }
-        if source != "GET_CLOCK", let existing = backfiller?.strapClockOffset, existing != 0 { return }
+        // GET_DATA_RANGE reports the newest RECORD, which is only the strap's "now" if it was
+        // recording until a moment ago; GET_CLOCK reports the clock itself. So the exact reading
+        // always overwrites the estimate, and never the other way round.
+        if source != "GET_CLOCK", strapClockFromGetClock { return }
+        if source == "GET_CLOCK" { strapClockFromGetClock = true }
         guard backfiller?.strapClockOffset != offset else { return }
         backfiller?.strapClockOffset = offset
         log(String(format: "Strap-Uhr geht um %.1f Tage falsch (%@, Strap sagt %@) — Zeitstempel der Historie werden korrigiert",
@@ -920,6 +926,15 @@ extension BLEManager: CBPeripheralDelegate {
             // Reassemble (no-op for already-complete frames) then route each complete frame.
             for frame in reassembler.feed(bytes) {
                 router.handle(frame: frame)                       // UI (always)
+                // A GET_CLOCK reply is the exact reading of the strap's RTC, so it is worth
+                // parsing every time one arrives — the correlation may already exist from an
+                // earlier connect while the strap's clock has since been lost or reset. Cheap: one
+                // byte compare rejects the realtime flood before any parsing happens.
+                if frame.count > 6, frame[6] == WhoopCommand.getClock.rawValue,
+                   let ref = ClockCorrelation.clockRef(from: parseFrame(frame),
+                                                       wall: Int(Date().timeIntervalSince1970)) {
+                    noteStrapClock(ref.device, source: "GET_CLOCK")
+                }
                 if frame.count > 6, frame[6] == WhoopCommand.getDataRange.rawValue,
                    let newest = BLEManager.dataRangeNewestUnix(from: frame) {
                     strapNewestTs = newest                        // feeds the liveness watchdog
