@@ -256,9 +256,9 @@ struct TrackingDiagnosticsView: View {
                 let days = abs(offset) / 86_400
                 let hours = (abs(offset) % 86_400) / 3600
                 let direction = offset > 0 ? "voraus" : "nach"
-                var magnitude = ""
-                if days > 0 { magnitude += "\(days) Tag\(days == 1 ? "" : "e") " }
-                magnitude += "\(hours) Std."
+                let magnitude = days > 0
+                    ? "\(days) Tag\(days == 1 ? "" : "e") \(hours) Std."
+                    : "\(hours) Std."
 
                 summaryRow("Abweichung", "\(magnitude) \(direction)")
                 summaryRow("Quelle", d.strapClockSource == "GET_CLOCK" ? "exakt gemessen" : "geschätzt")
