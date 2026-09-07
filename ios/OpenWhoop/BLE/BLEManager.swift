@@ -859,14 +859,29 @@ extension BLEManager: CBPeripheralDelegate {
     /// Newest plausible-unix marker in a GET_DATA_RANGE COMMAND_RESPONSE = the strap's newest stored
     /// record. Mirrors re/diagnose_biometrics.py: scan u32 LE words in the response body (data starts at
     /// frame[7], after [type,seq,cmd]), keep those in the unix range, return the max. nil if none.
+    /// Record how far the strap's own clock is from ours, and hand that to the Backfiller so a
+    /// backlog the strap mis-stamped can be shifted back onto real time instead of discarded.
+    /// GET_CLOCK is the better source and wins once it answers; GET_DATA_RANGE is what we get on
+    /// every connect. Below the repair threshold this is ordinary drift and nothing is changed.
+    private func noteStrapClock(_ strapUnix: Int, source: String) {
+        let offset = strapUnix - Int(Date().timeIntervalSince1970)
+        guard abs(offset) >= Backfiller.clockRepairThreshold else { return }
+        if source != "GET_CLOCK", let existing = backfiller?.strapClockOffset, existing != 0 { return }
+        guard backfiller?.strapClockOffset != offset else { return }
+        backfiller?.strapClockOffset = offset
+        log(String(format: "Strap-Uhr geht um %.1f Tage falsch (%@, Strap sagt %@) — Zeitstempel der Historie werden korrigiert",
+                   Double(offset) / 86_400.0, source, BLEManager.isoDay(strapUnix)))
+    }
+
     static func dataRangeNewestUnix(from frame: [UInt8], now: Int = Int(Date().timeIntervalSince1970)) -> Int? {
         guard frame.count > 7 else { return nil }
         let body = Array(frame[7...]); var newest: Int? = nil; var i = 0
-        // Window it around the PRESENT rather than accepting any word in a decade-wide range.
-        // The old bounds let an arbitrary byte pattern pass as a timestamp — one did, and the
-        // liveness check then reported the strap as ~1.5 million minutes ahead of us.
-        let lower = now - 400 * 86_400
-        let upper = now + 86_400
+        // The window has to be wide enough to still recognise a strap whose RTC is years out —
+        // that reading is the measurement that rescues its backlog — but narrow enough that an
+        // arbitrary byte pattern cannot pass as a timestamp. Ten years either side of now does
+        // both: no plausible payload word lands there by accident, and a broken RTC does.
+        let lower = now - 10 * 365 * 86_400
+        let upper = now + 10 * 365 * 86_400
         while i + 4 <= body.count {
             let w = Int(body[i]) | Int(body[i+1]) << 8 | Int(body[i+2]) << 16 | Int(body[i+3]) << 24
             if w >= lower && w <= upper { newest = max(newest ?? 0, w) }
@@ -908,6 +923,12 @@ extension BLEManager: CBPeripheralDelegate {
                 if frame.count > 6, frame[6] == WhoopCommand.getDataRange.rawValue,
                    let newest = BLEManager.dataRangeNewestUnix(from: frame) {
                     strapNewestTs = newest                        // feeds the liveness watchdog
+                    // GET_DATA_RANGE is a reading of the strap's own clock, and unlike GET_CLOCK it
+                    // arrives on every connect. When the strap answers that its newest record is
+                    // years from now, its RTC — not our data — is what is wrong, and that distance
+                    // is exactly the correction the historical timestamps need. GET_CLOCK still
+                    // wins when it answers; this is the measurement for when it doesn't.
+                    noteStrapClock(newest, source: "GET_DATA_RANGE")
                 }
                 // Clock correlation runs in both live and backfill modes. Once established it
                 // unblocks both the Collector (live path) and the Backfiller (chunk decoding).
@@ -926,14 +947,7 @@ extension BLEManager: CBPeripheralDelegate {
                         collector?.clockRef = ref                  // unblocks buffered persistence
                         backfiller?.clockRef = ref                 // unblocks historical chunk decode
                         log("Clock correlated: device=\(ref.device) wall=\(ref.wall)")
-                        if fromGetClock != nil {
-                            let offset = ref.device - ref.wall
-                            backfiller?.strapClockOffset = offset
-                            if abs(offset) >= Backfiller.clockRepairThreshold {
-                                log(String(format: "Strap-Uhr geht um %.1f Tage falsch — Zeitstempel der Historie werden korrigiert",
-                                           Double(offset) / 86_400.0))
-                            }
-                        }
+                        if fromGetClock != nil { noteStrapClock(ref.device, source: "GET_CLOCK") }
                         // Conditional SET_CLOCK (mirrors WHOOP): only when the strap RTC has drifted /
                         // is frozen — not blindly every connect. Offload doesn't depend on this (it uses
                         // clockRef for decoding); SET_CLOCK only keeps FUTURE logging timestamps sane.

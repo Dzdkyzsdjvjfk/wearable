@@ -23,18 +23,33 @@ final class OffloadResilienceTests: XCTestCase {
 
     // MARK: - Strap's reported newest record
 
-    /// The liveness check once reported the strap as ~1.5 million minutes ahead of us, because any
-    /// four bytes falling in a decade-wide range counted as a timestamp.
-    func testDataRangeIgnoresWordsFarFromThePresent() {
-        func frame(_ value: Int) -> [UInt8] {
-            var f: [UInt8] = [0xAA, 0, 0, 0, 0, 0, 0]
-            f += [UInt8(value & 0xFF), UInt8((value >> 8) & 0xFF),
-                  UInt8((value >> 16) & 0xFF), UInt8((value >> 24) & 0xFF)]
-            return f
-        }
-        XCTAssertEqual(BLEManager.dataRangeNewestUnix(from: frame(now - 3600), now: now), now - 3600)
-        XCTAssertNil(BLEManager.dataRangeNewestUnix(from: frame(1_879_172_133), now: now),
-                     "a value three years out is a byte pattern, not a record time")
+    private func dataRangeFrame(_ value: Int) -> [UInt8] {
+        var f: [UInt8] = [0xAA, 0, 0, 0, 0, 0, 0]
+        f += [UInt8(value & 0xFF), UInt8((value >> 8) & 0xFF),
+              UInt8((value >> 16) & 0xFF), UInt8((value >> 24) & 0xFF)]
+        return f
+    }
+
+    func testDataRangeReadsARecentRecordTime() {
+        XCTAssertEqual(BLEManager.dataRangeNewestUnix(from: dataRangeFrame(now - 3600), now: now),
+                       now - 3600)
+    }
+
+    /// A strap whose RTC is years out still answers GET_DATA_RANGE, and that answer is the
+    /// measurement that rescues its backlog — so it has to survive the filter, not be discarded as
+    /// noise the way it once was.
+    func testDataRangeKeepsAStrapClockThatIsYearsOut() {
+        XCTAssertEqual(BLEManager.dataRangeNewestUnix(from: dataRangeFrame(1_879_172_133), now: now),
+                       1_879_172_133,
+                       "three years ahead is a broken clock we can correct for, not a byte pattern")
+    }
+
+    /// The window still has to reject words that cannot be any clock at all, or the liveness check
+    /// goes back to reporting nonsense.
+    func testDataRangeStillRejectsWordsThatAreNoClockAtAll() {
+        XCTAssertNil(BLEManager.dataRangeNewestUnix(from: dataRangeFrame(0), now: now))
+        XCTAssertNil(BLEManager.dataRangeNewestUnix(from: dataRangeFrame(now + 40 * 365 * 86_400),
+                                                    now: now))
     }
 
     // MARK: - Sleep detection without day/night contrast
