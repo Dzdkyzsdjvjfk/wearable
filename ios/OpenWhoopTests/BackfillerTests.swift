@@ -358,6 +358,42 @@ final class BackfillerTests: XCTestCase {
         XCTAssertEqual(acks, [42], "empty END still acks to advance the offload")
     }
 
+    // The strap answers "no more history" with a HISTORY_END whose end_data is the all-ones
+    // sentinel, not a real cursor. The ack still has to go out — that is what completes the
+    // handshake — but the sentinel must never be written into strap_trim: it can only ever be
+    // equalled, never advanced past, which would poison every future reading of that cursor.
+    func testSentinelEndAcksButDoesNotPersistTheCursor() async throws {
+        let store = SpyBackfillStore()
+        var acks: [UInt32] = []
+        let bf = Backfiller(store: store, deviceId: "whoop-test",
+                            ackTrim: { v, _ in acks.append(v) },
+                            extract: { _, _, _ in Streams() })
+        bf.clockRef = defaultRef()
+        bf.begin()
+        await bf.ingest(endFrame(unix: 1_700_001_000, trim: Backfiller.noDataSentinel))
+
+        XCTAssertEqual(store.calls, [], "the sentinel is not a real cursor and must not be stored")
+        XCTAssertEqual(acks, [Backfiller.noDataSentinel],
+                       "the strap still gets its ack so the handshake completes")
+    }
+
+    // A real trim cursor arriving right after a sentinel must still be persisted normally — the
+    // guard is specific to the sentinel value, not a one-way latch.
+    func testRealCursorAfterSentinelStillPersists() async throws {
+        let store = SpyBackfillStore()
+        var acks: [UInt32] = []
+        let bf = Backfiller(store: store, deviceId: "whoop-test",
+                            ackTrim: { v, _ in acks.append(v) },
+                            extract: { _, _, _ in Streams() })
+        bf.clockRef = defaultRef()
+        bf.begin()
+        await bf.ingest(endFrame(unix: 1_700_001_000, trim: Backfiller.noDataSentinel))
+        await bf.ingest(endFrame(unix: 1_700_001_060, trim: 99))
+
+        XCTAssertEqual(store.calls, [.setCursor(name: "strap_trim", value: 99)])
+        XCTAssertEqual(acks, [Backfiller.noDataSentinel, 99])
+    }
+
     // MARK: - chunk with clockRef == nil → identity-fallback (type-47 is self-contained)
 
     // type-47 historical payloads are self-timestamped, so the Backfiller no longer blocks on a

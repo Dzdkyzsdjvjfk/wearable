@@ -236,6 +236,13 @@ final class Backfiller {
     /// TRUE so the records following this END become the next chunk. An END with no accumulated
     /// records is still acked (it advances the strap's trim) — that's how the offload progresses.
     /// `endFrame` carries the 8-byte `end_data` the ack requires.
+    /// The strap signals "nothing left to give" with a HISTORY_END whose end_data is the
+    /// all-ones sentinel, not a real cursor value. Acking it completes the handshake exactly like
+    /// any other END — the strap expects that regardless of what it sent — but persisting
+    /// UInt32.max as our own strap_trim bookkeeping would leave that cursor stuck at a value nothing
+    /// can ever exceed, poisoning it for good.
+    static let noDataSentinel: UInt32 = 0xFFFFFFFF
+
     private func finishChunk(unix: UInt32, trim: UInt32, endFrame: [UInt8]) async {
         guard let endData = Backfiller.endData(from: endFrame) else { return }
 
@@ -269,7 +276,9 @@ final class Backfiller {
                 do { try await store.enqueueRawBatch(meta, frames: frames) } catch { return }
             }
         }
-        do { try await store.setCursor("strap_trim", Int(trim)) } catch { return }
+        if trim != Backfiller.noDataSentinel {
+            do { try await store.setCursor("strap_trim", Int(trim)) } catch { return }
+        }
 
         ackTrim(trim, endData)
     }
