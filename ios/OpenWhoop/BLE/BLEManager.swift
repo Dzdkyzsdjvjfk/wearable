@@ -72,9 +72,14 @@ public final class BLEManager: NSObject, ObservableObject {
     /// How many back-to-back offloads the current drain has already run. See exitBackfilling:
     /// one SEND_HISTORICAL_DATA returns a bounded batch, so a backlog needs several rounds.
     private var backfillDrainRounds = 0
-    /// Safety cap on that loop, so a strap that keeps answering "complete, here is one more row"
-    /// cannot spin forever.
-    static let maxDrainRounds = 60
+    /// Safety caps on that loop, so a strap that keeps answering "complete, here is one more row"
+    /// cannot spin forever. Two days away is already ~2900 records at roughly one a minute, and a
+    /// round returns a bounded batch (~50), so the round cap has to be in the hundreds to cover a
+    /// normal gap; the wall-clock budget is what actually stops a pathological strap.
+    static let maxDrainRounds = 400
+    static let maxDrainSeconds: TimeInterval = 900
+    /// Wall clock when the current drain began, for that budget.
+    private var backfillDrainStartedAt: TimeInterval = 0
     /// Runs the connect handshake EXACTLY ONCE per connection. `didWriteValueFor` re-fires on every
     /// `.withResponse` write (the bond write, every SEND_HISTORICAL, every HISTORY_END ack); without
     /// this guard those re-entries re-blasted hello/SET_CLOCK at the strap mid-offload and stopped it
@@ -365,11 +370,20 @@ public final class BLEManager: NSObject, ObservableObject {
         // matters when a night is missing.
         let stored = backfiller?.sessionRows ?? 0
         let rejected = backfiller?.sessionRejected ?? 0
+        let repaired = backfiller?.sessionRepaired ?? 0
         var summary = "Backfill: session ended — reason=\(reason), \(stored) Messwerte gespeichert"
         if let lo = backfiller?.sessionOldestTs, let hi = backfiller?.sessionNewestTs {
             summary += ", Zeitraum \(BLEManager.hhmm(lo))–\(BLEManager.hhmm(hi))"
         }
-        if rejected > 0 { summary += ", \(rejected) mit unplausibler Uhrzeit verworfen" }
+        if repaired > 0 { summary += ", \(repaired) mit korrigierter Strap-Uhr" }
+        if rejected > 0 {
+            summary += ", \(rejected) mit unplausibler Uhrzeit verworfen"
+            // WHERE the strap thought it was is the whole diagnosis: 1970 means a dead RTC, 2029
+            // means an RTC running years ahead, and the two need opposite fixes.
+            if let lo = backfiller?.rejectedOldestTs, let hi = backfiller?.rejectedNewestTs {
+                summary += " (Strap-Zeit \(BLEManager.isoDay(lo))–\(BLEManager.isoDay(hi)))"
+            }
+        }
         log(summary)
 
         // The offload monopolises the link; re-arm the realtime stream so live capture resumes.
@@ -380,7 +394,14 @@ public final class BLEManager: NSObject, ObservableObject {
         // delivered nine of ~2900 pending. Waiting for the 15-minute periodic tick between rounds
         // would take hours; asking again immediately, for as long as rounds keep delivering data,
         // drains the backlog in one connection. A round that stores nothing ends the loop.
-        if reason == "HISTORY_COMPLETE", stored > 0, backfillDrainRounds < BLEManager.maxDrainRounds {
+        // A round that delivered records the clock made unusable still proves the strap has more to
+        // give, so `rejected` counts towards continuing — otherwise one bad batch ends the drain.
+        let delivered = stored + rejected
+        let nowWall = Date().timeIntervalSince1970
+        if backfillDrainRounds == 0 { backfillDrainStartedAt = nowWall }
+        if reason == "HISTORY_COMPLETE", delivered > 0,
+           backfillDrainRounds < BLEManager.maxDrainRounds,
+           nowWall - backfillDrainStartedAt < BLEManager.maxDrainSeconds {
             backfillDrainRounds += 1
             log("Backfill: mehr Daten vorhanden — Runde \(backfillDrainRounds) wird angefordert")
             UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: BLEManager.backfillLastAtKey)
@@ -795,7 +816,9 @@ extension BLEManager: CBPeripheralDelegate {
         // (PHASE A = 50 records; PHASE B high-freq = 0). We still exchange hello to mirror WHOOP exactly.
         send(.getHelloHarvard)
         send(.getAdvertisingNameHarvard)
-        send(.setClock, payload: BLEManager.setClockPayload())
+        // GET_CLOCK goes FIRST, before SET_CLOCK overwrites the evidence. Writes are serialised, so
+        // the reply carries the RTC the strap kept while it was recording alone — the only chance to
+        // measure how wrong it was, and therefore the only way to rescue a backlog it mis-stamped.
         if clockRef == nil && !clockRequested {
             clockRequested = true
             send(.getClock, payload: [])   // the strap expects GET_CLOCK with an EMPTY payload;
@@ -803,6 +826,7 @@ extension BLEManager: CBPeripheralDelegate {
                                            // (Offload no longer depends on this — Backfiller falls back to an
                                            // identity clockRef — but a real correlation helps realtime decode.)
         }
+        send(.setClock, payload: BLEManager.setClockPayload())
         send(.sendR10R11Realtime, payload: [0x00])   // stop the type-43 realtime flood (BLE airtime/battery)
         // Type-40 REALTIME_DATA: ~1 Hz heart rate WITH R-R intervals, which is the only dense
         // source of beat-to-beat data there is. The strap's own history records carry an R-R count
@@ -852,6 +876,13 @@ extension BLEManager: CBPeripheralDelegate {
     }
 
     /// HH:mm for a unix timestamp, for the offload summary line.
+    /// Calendar day of a timestamp, for log lines about timestamps that are years out.
+    static func isoDay(_ ts: Int) -> String {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        return f.string(from: Date(timeIntervalSince1970: TimeInterval(ts)))
+    }
+
     static func hhmm(_ ts: Int) -> String {
         let f = DateFormatter(); f.dateFormat = "dd.MM. HH:mm"
         return f.string(from: Date(timeIntervalSince1970: TimeInterval(ts)))
@@ -885,12 +916,24 @@ extension BLEManager: CBPeripheralDelegate {
                     // GET_CLOCK first; a realtime frame is the fallback when the strap stays
                     // silent on it, so live data is never stranded waiting for a correlation.
                     let wallNow = Int(Date().timeIntervalSince1970)
-                    if let ref = ClockCorrelation.clockRef(from: parsed, wall: wallNow)
+                    // Only the genuine GET_CLOCK reply is a statement about the strap's RTC. The
+                    // realtime fallback carries a different clock domain, so it must never be used
+                    // to judge — let alone rewrite — historical timestamps.
+                    let fromGetClock = ClockCorrelation.clockRef(from: parsed, wall: wallNow)
+                    if let ref = fromGetClock
                         ?? ClockCorrelation.realtimeClockRef(from: parsed, wall: wallNow) {
                         clockRef = ref
                         collector?.clockRef = ref                  // unblocks buffered persistence
                         backfiller?.clockRef = ref                 // unblocks historical chunk decode
                         log("Clock correlated: device=\(ref.device) wall=\(ref.wall)")
+                        if fromGetClock != nil {
+                            let offset = ref.device - ref.wall
+                            backfiller?.strapClockOffset = offset
+                            if abs(offset) >= Backfiller.clockRepairThreshold {
+                                log(String(format: "Strap-Uhr geht um %.1f Tage falsch — Zeitstempel der Historie werden korrigiert",
+                                           Double(offset) / 86_400.0))
+                            }
+                        }
                         // Conditional SET_CLOCK (mirrors WHOOP): only when the strap RTC has drifted /
                         // is frozen — not blindly every connect. Offload doesn't depend on this (it uses
                         // clockRef for decoding); SET_CLOCK only keeps FUTURE logging timestamps sane.

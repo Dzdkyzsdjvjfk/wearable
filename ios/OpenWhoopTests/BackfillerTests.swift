@@ -15,6 +15,9 @@ final class SpyBackfillStore: BackfillStoreWriting {
     }
 
     var calls: [Call] = []
+    /// Every Streams handed to insert(), so a test can assert what actually got stored — not just
+    /// that a store call happened.
+    var inserted: [Streams] = []
     /// Persisted cursor store — survives across Backfiller instances (models a reconnect against
     /// the same on-disk store). `cursor(_:)` reads from here so a resume test can assert the
     /// strap_trim cursor survived a disconnect.
@@ -31,6 +34,7 @@ final class SpyBackfillStore: BackfillStoreWriting {
             spo2: Int, skinTemp: Int, resp: Int, gravity: Int) {
         if insertShouldThrow { throw TestError.insert }
         calls.append(.insert)
+        inserted.append(streams)
         return insertResult
     }
 
@@ -589,6 +593,96 @@ final class BackfillerSessionTelemetryTests: XCTestCase {
         await bf.ingest(dataFrame())
         await bf.ingest(endFrame(unix: 1_700_001_000, trim: 7))
         XCTAssertEqual(bf.sessionRows, 0)
+        XCTAssertEqual(bf.sessionRejected, 1)
+    }
+
+    /// The rejected range is the diagnosis: "2900 rows discarded" says nothing, "the strap thought
+    /// it was 2029" says everything.
+    func testRejectedRangeIsRecorded() async throws {
+        let far = now + 900 * 86_400
+        let store = SpyBackfillStore()
+        let bf = Backfiller(store: store, deviceId: "whoop-test",
+                            ackTrim: { _, _ in },
+                            now: { self.now },
+                            extract: { _, _, _ in
+                                Streams(hr: [HRSample(ts: far, bpm: 50),
+                                             HRSample(ts: far + 600, bpm: 51)])
+                            })
+        bf.clockRef = ClockRef(device: 1_000_000, wall: 1_700_000_000)
+        bf.begin()
+        await bf.ingest(metaFrame(1))
+        await bf.ingest(dataFrame())
+        await bf.ingest(endFrame(unix: 1_700_001_000, trim: 7))
+
+        XCTAssertEqual(bf.sessionRejected, 2)
+        XCTAssertEqual(bf.rejectedOldestTs, far)
+        XCTAssertEqual(bf.rejectedNewestTs, far + 600)
+    }
+
+    /// A strap whose RTC ran years ahead recorded perfectly good data under impossible timestamps.
+    /// With the offset measured at connect, those rows are worth rescuing, not discarding.
+    func testMeasuredClockOffsetRescuesMisstampedRows() async throws {
+        let offset = 900 * 86_400
+        let store = SpyBackfillStore()
+        let bf = Backfiller(store: store, deviceId: "whoop-test",
+                            ackTrim: { _, _ in },
+                            now: { self.now },
+                            extract: { _, _, _ in
+                                Streams(hr: [HRSample(ts: self.now - 600 + offset, bpm: 55),
+                                             HRSample(ts: self.now - 300 + offset, bpm: 57)])
+                            })
+        bf.strapClockOffset = offset
+        bf.clockRef = ClockRef(device: 1_000_000, wall: 1_700_000_000)
+        bf.begin()
+        await bf.ingest(metaFrame(1))
+        await bf.ingest(dataFrame())
+        await bf.ingest(endFrame(unix: 1_700_001_000, trim: 7))
+
+        XCTAssertEqual(bf.sessionRows, 2, "both rows land in the store")
+        XCTAssertEqual(bf.sessionRepaired, 2)
+        XCTAssertEqual(bf.sessionRejected, 0)
+        XCTAssertEqual(bf.sessionOldestTs, now - 600, "shifted back onto the real wall clock")
+        XCTAssertEqual(bf.sessionNewestTs, now - 300)
+        XCTAssertEqual(store.inserted.first?.hr.map(\.ts), [now - 600, now - 300])
+    }
+
+    /// The repair must never touch timestamps that are already fine — ordinary seconds-level drift
+    /// stays below the threshold and rows are stored exactly as decoded.
+    func testSmallDriftNeverRewritesGoodTimestamps() async throws {
+        let store = SpyBackfillStore()
+        let bf = Backfiller(store: store, deviceId: "whoop-test",
+                            ackTrim: { _, _ in },
+                            now: { self.now },
+                            extract: { _, _, _ in Streams(hr: [HRSample(ts: self.now - 120, bpm: 52)]) })
+        bf.strapClockOffset = 45
+        bf.clockRef = ClockRef(device: 1_000_000, wall: 1_700_000_000)
+        bf.begin()
+        await bf.ingest(metaFrame(1))
+        await bf.ingest(dataFrame())
+        await bf.ingest(endFrame(unix: 1_700_001_000, trim: 7))
+
+        XCTAssertEqual(bf.sessionRepaired, 0)
+        XCTAssertEqual(bf.sessionRows, 1)
+        XCTAssertEqual(store.inserted.first?.hr.map(\.ts), [now - 120])
+    }
+
+    /// An offset that does not explain the timestamps must not be applied — a row that is still
+    /// impossible after the shift is dropped, not stored somewhere else that is equally wrong.
+    func testOffsetThatDoesNotExplainTheRowStillRejectsIt() async throws {
+        let store = SpyBackfillStore()
+        let bf = Backfiller(store: store, deviceId: "whoop-test",
+                            ackTrim: { _, _ in },
+                            now: { self.now },
+                            extract: { _, _, _ in Streams(hr: [HRSample(ts: 0, bpm: 50)]) })
+        bf.strapClockOffset = 900 * 86_400
+        bf.clockRef = ClockRef(device: 1_000_000, wall: 1_700_000_000)
+        bf.begin()
+        await bf.ingest(metaFrame(1))
+        await bf.ingest(dataFrame())
+        await bf.ingest(endFrame(unix: 1_700_001_000, trim: 7))
+
+        XCTAssertEqual(bf.sessionRows, 0)
+        XCTAssertEqual(bf.sessionRepaired, 0)
         XCTAssertEqual(bf.sessionRejected, 1)
     }
 }

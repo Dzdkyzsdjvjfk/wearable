@@ -65,6 +65,24 @@ final class Backfiller {
     private(set) var sessionNewestTs: Int?
     /// Rows dropped because their timestamp was not plausible (see `isPlausible`).
     private(set) var sessionRejected = 0
+    /// Oldest / newest timestamp among the REJECTED rows. Without this the log could say "2900
+    /// rows discarded" and still not say whether the strap stamped them in 1970 or in 2029 — which
+    /// is the whole question when a night is missing.
+    private(set) var rejectedOldestTs: Int?
+    private(set) var rejectedNewestTs: Int?
+    /// Rows whose timestamp was implausible but became plausible after subtracting the measured
+    /// strap-RTC offset, i.e. rescued rather than thrown away.
+    private(set) var sessionRepaired = 0
+
+    /// The strap's RTC error, measured at connect as (strap clock − phone clock) BEFORE any
+    /// SET_CLOCK correction. Type-47 history carries the strap's own absolute unix stamps, so a
+    /// wrong RTC makes a whole backlog land years away from now — stored, but outside every window
+    /// the app ever reads, which looks exactly like no data at all. Set by BLEManager; 0 means
+    /// "not measured" and disables the repair.
+    var strapClockOffset = 0
+    /// Only offsets past this are treated as a broken RTC. Below it, ordinary drift is left alone
+    /// so healthy timestamps are never rewritten.
+    static let clockRepairThreshold = 6 * 3_600
 
     /// Wall clock, injectable for tests.
     private let now: () -> Int
@@ -112,30 +130,65 @@ final class Backfiller {
         sessionOldestTs = nil
         sessionNewestTs = nil
         sessionRejected = 0
+        sessionRepaired = 0
+        rejectedOldestTs = nil
+        rejectedNewestTs = nil
     }
 
-    /// Drops rows whose timestamp is implausible and updates the session counters.
-    /// Returns the streams that are safe to store.
+    /// Repairs, keeps or drops each row by its timestamp, and updates the session counters.
+    ///
+    /// Three outcomes per row, in order:
+    ///   1. plausible already          → kept as is;
+    ///   2. implausible, but plausible after subtracting the measured strap-RTC offset → repaired
+    ///      (the strap's clock was wrong while it recorded; the data itself is fine);
+    ///   3. still implausible          → dropped, and its timestamp recorded so the log can say
+    ///      *where* the strap thinks it was.
     private func vet(_ streams: Streams) -> Streams {
         let t = now()
-        func keep(_ ts: Int) -> Bool { Backfiller.isPlausible(ts, now: t) }
+        let offset = abs(strapClockOffset) >= Backfiller.clockRepairThreshold ? strapClockOffset : 0
 
-        let hr = streams.hr.filter { keep($0.ts) }
-        let rr = streams.rr.filter { keep($0.ts) }
-        let spo2 = streams.spo2.filter { keep($0.ts) }
-        let skin = streams.skinTemp.filter { keep($0.ts) }
-        let resp = streams.resp.filter { keep($0.ts) }
-        let grav = streams.gravity.filter { keep($0.ts) }
-        let events = streams.events.filter { keep($0.ts) }
-        let battery = streams.battery.filter { keep($0.ts) }
+        var repaired = 0
+        var rejected = 0
+        var rejLo: Int?
+        var rejHi: Int?
 
-        let before = streams.hr.count + streams.rr.count + streams.spo2.count
-            + streams.skinTemp.count + streams.resp.count + streams.gravity.count
-            + streams.events.count + streams.battery.count
-        let after = hr.count + rr.count + spo2.count + skin.count
+        /// nil = drop this row; otherwise the timestamp to store it under.
+        func fix(_ ts: Int) -> Int? {
+            if Backfiller.isPlausible(ts, now: t) { return ts }
+            if offset != 0 {
+                let corrected = ts - offset
+                if Backfiller.isPlausible(corrected, now: t) {
+                    repaired += 1
+                    return corrected
+                }
+            }
+            rejected += 1
+            rejLo = min(rejLo ?? ts, ts)
+            rejHi = max(rejHi ?? ts, ts)
+            return nil
+        }
+
+        let hr = streams.hr.compactMap { s in fix(s.ts).map { HRSample(ts: $0, bpm: s.bpm) } }
+        let rr = streams.rr.compactMap { s in fix(s.ts).map { RRInterval(ts: $0, rrMs: s.rrMs) } }
+        let spo2 = streams.spo2.compactMap { s in
+            fix(s.ts).map { SpO2Sample(ts: $0, red: s.red, ir: s.ir, unit: s.unit) } }
+        let skin = streams.skinTemp.compactMap { s in
+            fix(s.ts).map { SkinTempSample(ts: $0, raw: s.raw, unit: s.unit) } }
+        let resp = streams.resp.compactMap { s in
+            fix(s.ts).map { RespSample(ts: $0, raw: s.raw, unit: s.unit) } }
+        let grav = streams.gravity.compactMap { s in
+            fix(s.ts).map { GravitySample(ts: $0, x: s.x, y: s.y, z: s.z, unit: s.unit) } }
+        let events = streams.events.compactMap { e in
+            fix(e.ts).map { WhoopEvent(ts: $0, kind: e.kind, payload: e.payload) } }
+        let battery = streams.battery.compactMap { b in
+            fix(b.ts).map { BatterySample(ts: $0, soc: b.soc, mv: b.mv, charging: b.charging) } }
+
+        sessionRepaired += repaired
+        sessionRejected += rejected
+        if let lo = rejLo { rejectedOldestTs = min(rejectedOldestTs ?? lo, lo) }
+        if let hi = rejHi { rejectedNewestTs = max(rejectedNewestTs ?? hi, hi) }
+        sessionRows += hr.count + rr.count + spo2.count + skin.count
             + resp.count + grav.count + events.count + battery.count
-        sessionRejected += max(0, before - after)
-        sessionRows += after
 
         let stamps = hr.map(\.ts) + rr.map(\.ts) + spo2.map(\.ts) + skin.map(\.ts)
             + resp.map(\.ts) + grav.map(\.ts) + events.map(\.ts) + battery.map(\.ts)
