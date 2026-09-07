@@ -204,14 +204,18 @@ enum LocalMetricsEngine {
         guard let low = percentile(allBpm, 0.05),
               let high = percentile(allBpm, 0.90) else { return [] }
 
-        // Sleep is only detectable when there IS a day/night contrast in the data. Without this
-        // guard a flat trace — strap on a desk, or a stretch of uniformly resting heart rate —
-        // would sit entirely under its own low-percentile threshold and get reported as one
-        // enormous night. Requiring the resting band to be at least 10% below the active band
-        // means "no clear drop" honestly yields no sleep rather than a fabricated one.
-        // The upper reference is the 90th percentile, not the median: on a normal night sleep
-        // outnumbers wake, which drags the median down into the sleeping range.
-        guard low < high * 0.90 else { return [] }
+        // Sleep is normally found by day/night CONTRAST: a resting band at least 10 % below the
+        // active band. The upper reference is the 90th percentile, not the median, because on a
+        // normal night sleep outnumbers wake and would drag the median into the sleeping range.
+        //
+        // But contrast requires daytime data, and there is a real case with none: the strap
+        // records around the clock while the phone is away, then hands over a stretch that is
+        // mostly nights — or the wearer had a quiet day. The old code returned NOTHING there,
+        // which is how a night that was recorded perfectly well ends up as "no sleep data".
+        // So when contrast is missing we still look, but only accept runs that actually sit in
+        // the middle of the night by the clock. A flat trace from a strap on a desk cannot
+        // satisfy that for hours on end, which is what the guard was protecting against.
+        let hasContrast = low < high * 0.90
 
         let threshold = low * (1 + config.sleepHRMarginFraction)
 
@@ -225,7 +229,9 @@ enum LocalMetricsEngine {
         var disturbances = 0
 
         func closeRun(endIndex: Int) {
-            guard let s = runStart, asleepCount >= minBins else {
+            guard let s = runStart, asleepCount >= minBins,
+                  hasContrast || LocalMetricsEngine.looksLikeANight(bins, from: s, to: endIndex,
+                                                                    binSeconds: config.binSeconds) else {
                 runStart = nil; lastAsleep = nil; gapBins = 0; asleepCount = 0; disturbances = 0
                 return
             }
@@ -378,6 +384,43 @@ enum LocalMetricsEngine {
 
     /// Median heart rate per fixed-width time bin, oldest first. Bins with no samples are absent
     /// (not zero-filled), so callers can tell "quiet" apart from "not worn".
+    /// The fallback acceptance rule, used ONLY when the data carries no day/night contrast to
+    /// judge by. Three things have to hold at once, and together they are what separates a night
+    /// the phone simply wasn't there for from the flat trace the contrast guard exists to reject:
+    ///   1. it sits in the small hours by the clock,
+    ///   2. it is not longer than a night can be — an unbroken 14-hour "sleep" is a sensor that
+    ///      stopped varying, not a person,
+    ///   3. the heart rate actually moves across it. A living heart wanders by several bpm over
+    ///      hours; a reading that never changes is a stuck or unworn sensor.
+    static func looksLikeANight(_ bins: [(ts: Int, bpm: Double)], from: Int, to: Int,
+                                binSeconds: Int) -> Bool {
+        guard from <= to, to < bins.count else { return false }
+        guard spansTheNight(from: bins[from].ts, to: bins[to].ts) else { return false }
+
+        let durationHours = Double(bins[to].ts + binSeconds - bins[from].ts) / 3600.0
+        guard durationHours <= 11 else { return false }
+
+        let values = bins[from...to].map { $0.bpm }
+        guard let hi = percentile(values, 0.90), let lo = percentile(values, 0.10),
+              hi - lo >= 2 else { return false }
+        return true
+    }
+
+    /// True when the interval covers any part of the local 01:00–05:00 window — the hours a
+    /// person is asleep if they are asleep at all.
+    static func spansTheNight(from: Int, to: Int) -> Bool {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone.current
+        var t = from
+        while t <= to {
+            let hour = cal.component(.hour, from: Date(timeIntervalSince1970: TimeInterval(t)))
+            if hour >= 1 && hour < 5 { return true }
+            t += 1800
+        }
+        let endHour = cal.component(.hour, from: Date(timeIntervalSince1970: TimeInterval(to)))
+        return endHour >= 1 && endHour < 5
+    }
+
     static func medianBins(hr: [HRSample], binSeconds: Int) -> [(ts: Int, bpm: Double)] {
         guard binSeconds > 0, !hr.isEmpty else { return [] }
         var buckets: [Int: [Double]] = [:]

@@ -52,6 +52,32 @@ final class Backfiller {
     /// True while a historical offload session is active.
     private(set) var isBackfilling = false
 
+    // MARK: - Session telemetry
+    //
+    // Until now a session logged the acks it sent and nothing about what came back, so "the strap
+    // said HISTORY_COMPLETE" was indistinguishable from "and it delivered nothing". These counters
+    // are what the Device log reports at the end of every offload.
+
+    /// Decoded rows committed during the CURRENT session (all streams together).
+    private(set) var sessionRows = 0
+    /// Oldest / newest record timestamp seen this session, for the log line.
+    private(set) var sessionOldestTs: Int?
+    private(set) var sessionNewestTs: Int?
+    /// Rows dropped because their timestamp was not plausible (see `isPlausible`).
+    private(set) var sessionRejected = 0
+
+    /// Wall clock, injectable for tests.
+    private let now: () -> Int
+
+    /// A record timestamp is only usable if it lands in a sane window around the present. The
+    /// strap stamps its own history from its RTC; if that RTC is wrong (it survives a flat
+    /// battery badly), records arrive stamped years away, get stored, and then sit outside every
+    /// window the app reads — invisible data that looks exactly like no data at all. Dropping and
+    /// COUNTING them turns that failure into something the diagnostics can show.
+    static func isPlausible(_ ts: Int, now: Int) -> Bool {
+        ts > now - 400 * 86_400 && ts < now + 86_400
+    }
+
     /// Buffered data frames for the current open chunk (between START and END).
     private var chunk: [[UInt8]] = []
     /// Whether a START has been received and we're accumulating a chunk.
@@ -61,11 +87,13 @@ final class Backfiller {
          deviceId: String,
          ackTrim: @escaping (_ trim: UInt32, _ endData: [UInt8]) -> Void,
          enableRawCapture: Bool = false,
+         now: @escaping () -> Int = { Int(Date().timeIntervalSince1970) },
          extract: @escaping Extractor = { extractHistoricalStreams($0, deviceClockRef: $1, wallClockRef: $2) }) {
         self.store = store
         self.deviceId = deviceId
         self.ackTrim = ackTrim
         self.enableRawCapture = enableRawCapture
+        self.now = now
         self.extract = extract
     }
 
@@ -76,6 +104,46 @@ final class Backfiller {
         isBackfilling = true
         chunk.removeAll(keepingCapacity: true)
         chunkOpen = true
+        resetSessionCounters()
+    }
+
+    private func resetSessionCounters() {
+        sessionRows = 0
+        sessionOldestTs = nil
+        sessionNewestTs = nil
+        sessionRejected = 0
+    }
+
+    /// Drops rows whose timestamp is implausible and updates the session counters.
+    /// Returns the streams that are safe to store.
+    private func vet(_ streams: Streams) -> Streams {
+        let t = now()
+        func keep(_ ts: Int) -> Bool { Backfiller.isPlausible(ts, now: t) }
+
+        let hr = streams.hr.filter { keep($0.ts) }
+        let rr = streams.rr.filter { keep($0.ts) }
+        let spo2 = streams.spo2.filter { keep($0.ts) }
+        let skin = streams.skinTemp.filter { keep($0.ts) }
+        let resp = streams.resp.filter { keep($0.ts) }
+        let grav = streams.gravity.filter { keep($0.ts) }
+        let events = streams.events.filter { keep($0.ts) }
+        let battery = streams.battery.filter { keep($0.ts) }
+
+        let before = streams.hr.count + streams.rr.count + streams.spo2.count
+            + streams.skinTemp.count + streams.resp.count + streams.gravity.count
+            + streams.events.count + streams.battery.count
+        let after = hr.count + rr.count + spo2.count + skin.count
+            + resp.count + grav.count + events.count + battery.count
+        sessionRejected += max(0, before - after)
+        sessionRows += after
+
+        let stamps = hr.map(\.ts) + rr.map(\.ts) + spo2.map(\.ts) + skin.map(\.ts)
+            + resp.map(\.ts) + grav.map(\.ts) + events.map(\.ts) + battery.map(\.ts)
+        if let lo = stamps.min() { sessionOldestTs = min(sessionOldestTs ?? lo, lo) }
+        if let hi = stamps.max() { sessionNewestTs = max(sessionNewestTs ?? hi, hi) }
+
+        return Streams(hr: hr, rr: rr, spo2: spo2, skinTemp: skin, resp: resp,
+                       gravity: grav, events: events, battery: battery)
     }
 
     /// Feed one raw BLE frame into the state machine. May trigger async store operations.
@@ -130,7 +198,7 @@ final class Backfiller {
             // truly required to map REALTIME (type-40/43) device-epoch timestamps, never in a hist chunk.
             let ref = clockRef ?? { let now = Int(Date().timeIntervalSince1970); return ClockRef(device: now, wall: now) }()
             let parsed = frames.map { parseFrame($0) }
-            let decoded = extract(parsed, ref.device, ref.wall)
+            let decoded = vet(extract(parsed, ref.device, ref.wall))
             do { try await store.insert(decoded, deviceId: deviceId) } catch { return }
 
             // RAW: only persisted when the research toggle is ON. Default OFF → decoded-only; the

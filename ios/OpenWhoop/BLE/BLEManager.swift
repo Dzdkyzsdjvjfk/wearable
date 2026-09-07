@@ -69,6 +69,12 @@ public final class BLEManager: NSObject, ObservableObject {
     static let backfillLastAtKey = "backfillLastAt"
     /// Prevents a second backfill from starting on a same-process reconnect to the same strap.
     private var backfillStarted = false
+    /// How many back-to-back offloads the current drain has already run. See exitBackfilling:
+    /// one SEND_HISTORICAL_DATA returns a bounded batch, so a backlog needs several rounds.
+    private var backfillDrainRounds = 0
+    /// Safety cap on that loop, so a strap that keeps answering "complete, here is one more row"
+    /// cannot spin forever.
+    static let maxDrainRounds = 60
     /// Runs the connect handshake EXACTLY ONCE per connection. `didWriteValueFor` re-fires on every
     /// `.withResponse` write (the bond write, every SEND_HISTORICAL, every HISTORY_END ack); without
     /// this guard those re-entries re-blasted hello/SET_CLOCK at the strap mid-offload and stopped it
@@ -352,9 +358,42 @@ public final class BLEManager: NSObject, ObservableObject {
         backfillTimeout?.cancel()
         backfillTimeout = nil
         backfillFrameQueue.removeAll()
-        log("Backfill: session ended — reason=\(reason)")
+
+        // What did this session actually DELIVER? Without this line the log showed the acks we
+        // sent and nothing about the data that came back, so "the strap said complete" could not
+        // be told apart from "and it handed over nothing" — which is exactly the question that
+        // matters when a night is missing.
+        let stored = backfiller?.sessionRows ?? 0
+        let rejected = backfiller?.sessionRejected ?? 0
+        var summary = "Backfill: session ended — reason=\(reason), \(stored) Messwerte gespeichert"
+        if let lo = backfiller?.sessionOldestTs, let hi = backfiller?.sessionNewestTs {
+            summary += ", Zeitraum \(BLEManager.hhmm(lo))–\(BLEManager.hhmm(hi))"
+        }
+        if rejected > 0 { summary += ", \(rejected) mit unplausibler Uhrzeit verworfen" }
+        log(summary)
+
         // The offload monopolises the link; re-arm the realtime stream so live capture resumes.
         if AppSettings.highDensityHR { send(.toggleRealtimeHR, payload: [0x01]) }
+
+        // DRAIN LOOP. One SEND_HISTORICAL_DATA returns a bounded batch and then HISTORY_COMPLETE
+        // even when the strap still holds days of records — after two days away the first round
+        // delivered nine of ~2900 pending. Waiting for the 15-minute periodic tick between rounds
+        // would take hours; asking again immediately, for as long as rounds keep delivering data,
+        // drains the backlog in one connection. A round that stores nothing ends the loop.
+        if reason == "HISTORY_COMPLETE", stored > 0, backfillDrainRounds < BLEManager.maxDrainRounds {
+            backfillDrainRounds += 1
+            log("Backfill: mehr Daten vorhanden — Runde \(backfillDrainRounds) wird angefordert")
+            UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: BLEManager.backfillLastAtKey)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                guard let self, self.state.connected, !self.backfilling else { return }
+                self.beginBackfill()
+            }
+            return   // liveness/upload housekeeping runs when the drain actually finishes
+        }
+        if backfillDrainRounds > 0 {
+            log("Backfill: Nachladen abgeschlossen nach \(backfillDrainRounds) Runden")
+            backfillDrainRounds = 0
+        }
         uploadOpportunistically()
         // Read-path sync runs AFTER the offload, never concurrently with it — the offload and the
         // pull share the WhoopStore actor, and a large first-run pull would starve the Backfiller's
@@ -748,6 +787,7 @@ extension BLEManager: CBPeripheralDelegate {
         guard !connectHandshakeDone else { return }
         connectHandshakeDone = true
         backfillStarted = true
+        backfillDrainRounds = 0
 
         // WHOOP-faithful connect lifecycle: hello → set RTC,
         // then offload. Hello is NOT strictly required to serve — verified on this strap via the Mac
@@ -795,15 +835,26 @@ extension BLEManager: CBPeripheralDelegate {
     /// Newest plausible-unix marker in a GET_DATA_RANGE COMMAND_RESPONSE = the strap's newest stored
     /// record. Mirrors re/diagnose_biometrics.py: scan u32 LE words in the response body (data starts at
     /// frame[7], after [type,seq,cmd]), keep those in the unix range, return the max. nil if none.
-    static func dataRangeNewestUnix(from frame: [UInt8]) -> Int? {
+    static func dataRangeNewestUnix(from frame: [UInt8], now: Int = Int(Date().timeIntervalSince1970)) -> Int? {
         guard frame.count > 7 else { return nil }
         let body = Array(frame[7...]); var newest: Int? = nil; var i = 0
+        // Window it around the PRESENT rather than accepting any word in a decade-wide range.
+        // The old bounds let an arbitrary byte pattern pass as a timestamp — one did, and the
+        // liveness check then reported the strap as ~1.5 million minutes ahead of us.
+        let lower = now - 400 * 86_400
+        let upper = now + 86_400
         while i + 4 <= body.count {
             let w = Int(body[i]) | Int(body[i+1]) << 8 | Int(body[i+2]) << 16 | Int(body[i+3]) << 24
-            if w >= 1_700_000_000 && w <= 1_900_000_000 { newest = max(newest ?? 0, w) }
+            if w >= lower && w <= upper { newest = max(newest ?? 0, w) }
             i += 4
         }
         return newest
+    }
+
+    /// HH:mm for a unix timestamp, for the offload summary line.
+    static func hhmm(_ ts: Int) -> String {
+        let f = DateFormatter(); f.dateFormat = "dd.MM. HH:mm"
+        return f.string(from: Date(timeIntervalSince1970: TimeInterval(ts)))
     }
 
     public func peripheral(_ peripheral: CBPeripheral,

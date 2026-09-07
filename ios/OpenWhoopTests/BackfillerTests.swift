@@ -519,3 +519,76 @@ final class BackfillerTests: XCTestCase {
                        "cursor advanced forward across the reconnect (10 → 30, never backward)")
     }
 }
+
+// MARK: - Session telemetry + timestamp vetting
+//
+// A session used to log the acks it sent and nothing about the data that came back, so "the
+// strap said HISTORY_COMPLETE" could not be told apart from "and it delivered nothing" — which
+// is exactly the question that matters when a night is missing.
+
+@MainActor
+final class BackfillerSessionTelemetryTests: XCTestCase {
+
+    private let now = 1_788_757_000
+
+    func testCountersReportStoredAndRejectedRows() async throws {
+        let store = SpyBackfillStore()
+        let bf = Backfiller(store: store, deviceId: "whoop-test",
+                            ackTrim: { _, _ in },
+                            now: { self.now },
+                            extract: { _, _, _ in
+                                Streams(hr: [HRSample(ts: self.now - 600, bpm: 55),
+                                             HRSample(ts: self.now - 540, bpm: 54),
+                                             HRSample(ts: self.now - 480, bpm: 56),
+                                             // A strap whose clock survived a flat battery badly:
+                                             HRSample(ts: self.now + 400 * 86_400, bpm: 60)])
+                            })
+        bf.clockRef = ClockRef(device: 1_000_000, wall: 1_700_000_000)
+        bf.begin()
+
+        await bf.ingest(metaFrame(1))
+        await bf.ingest(dataFrame())
+        await bf.ingest(endFrame(unix: 1_700_001_000, trim: 42))
+
+        XCTAssertEqual(bf.sessionRows, 3, "only plausible rows count as stored")
+        XCTAssertEqual(bf.sessionRejected, 1, "the future-stamped row is counted, not silently kept")
+        XCTAssertEqual(bf.sessionOldestTs, now - 600)
+        XCTAssertEqual(bf.sessionNewestTs, now - 480)
+    }
+
+    func testCountersResetOnANewSession() async throws {
+        let store = SpyBackfillStore()
+        let bf = Backfiller(store: store, deviceId: "whoop-test",
+                            ackTrim: { _, _ in },
+                            now: { self.now },
+                            extract: { _, _, _ in Streams(hr: [HRSample(ts: self.now, bpm: 50)]) })
+        bf.clockRef = ClockRef(device: 1_000_000, wall: 1_700_000_000)
+        bf.begin()
+        await bf.ingest(metaFrame(1))
+        await bf.ingest(dataFrame())
+        await bf.ingest(endFrame(unix: 1_700_001_000, trim: 7))
+        XCTAssertGreaterThan(bf.sessionRows, 0)
+
+        bf.begin()
+        XCTAssertEqual(bf.sessionRows, 0)
+        XCTAssertEqual(bf.sessionRejected, 0)
+        XCTAssertNil(bf.sessionOldestTs)
+    }
+
+    /// A chunk that decodes to nothing usable must leave the counters at zero — that is the
+    /// signal the drain loop uses to stop asking for more.
+    func testChunkWithOnlyImplausibleRowsStoresNothing() async throws {
+        let store = SpyBackfillStore()
+        let bf = Backfiller(store: store, deviceId: "whoop-test",
+                            ackTrim: { _, _ in },
+                            now: { self.now },
+                            extract: { _, _, _ in Streams(hr: [HRSample(ts: 0, bpm: 50)]) })
+        bf.clockRef = ClockRef(device: 1_000_000, wall: 1_700_000_000)
+        bf.begin()
+        await bf.ingest(metaFrame(1))
+        await bf.ingest(dataFrame())
+        await bf.ingest(endFrame(unix: 1_700_001_000, trim: 7))
+        XCTAssertEqual(bf.sessionRows, 0)
+        XCTAssertEqual(bf.sessionRejected, 1)
+    }
+}
