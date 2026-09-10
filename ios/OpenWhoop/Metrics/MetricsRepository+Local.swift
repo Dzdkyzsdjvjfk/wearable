@@ -108,6 +108,12 @@ extension MetricsRepository {
         }
         guard !dailies.isEmpty else { return }
 
+        // Clear out any earlier row for the SAME night before writing the fresh one. Without
+        // this, a night whose detected boundaries shift a few minutes between recomputes (which
+        // happens for any night that gets recomputed while still ongoing) piles up as several
+        // near-duplicate sessions instead of one updated session — see deleteSleepSessions' doc.
+        try? await store.deleteSleepSessions(deviceId: deviceId,
+                                             overlapping: sessions.map { ($0.startTs, $0.endTs) })
         _ = try? await store.upsertSleepSessions(sessions, deviceId: deviceId)
         _ = try? await store.upsertDailyMetrics(dailies, deviceId: deviceId)
     }

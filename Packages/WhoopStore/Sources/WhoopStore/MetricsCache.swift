@@ -84,6 +84,34 @@ extension WhoopStore {
         }
     }
 
+    /// Delete any stored sleep session that overlaps one of `windows`, so a fresh computation of
+    /// the same night REPLACES the old one instead of sitting beside it.
+    ///
+    /// sleepSession's natural key is (deviceId, startTs), but LocalMetricsEngine's detector finds
+    /// a window's start from the data itself — as more of a still-ongoing night streams in, an
+    /// earlier recompute's startTs (say 22:40) and a later recompute's (22:45, once a few more
+    /// minutes of heart rate have arrived and shifted the 5th-percentile threshold slightly) don't
+    /// match byte-for-byte, so the ON CONFLICT upsert in upsertSleepSessions creates a SECOND row
+    /// for what is really one night instead of updating the first. Over a few refreshes this left
+    /// several near-duplicate sessions for the same night, and which one the UI happened to read
+    /// as "last night" depended on upsert order rather than which was most complete — the visible
+    /// symptom was the same resting-HR / sleep-end numbers appearing to get stuck.
+    /// Two windows describing the same night always overlap in time even as their exact edges
+    /// drift a few minutes run to run, so an interval-overlap delete (rather than an exact-startTs
+    /// match) is what actually makes recompute idempotent.
+    public func deleteSleepSessions(deviceId: String,
+                                    overlapping windows: [(start: Int, end: Int)]) async throws {
+        guard !windows.isEmpty else { return }
+        try syncWrite { db in
+            for w in windows {
+                try db.execute(sql: """
+                    DELETE FROM sleepSession
+                    WHERE deviceId = ? AND startTs < ? AND endTs > ?
+                    """, arguments: [deviceId, w.end, w.start])
+            }
+        }
+    }
+
     /// Upsert cached daily metrics. Natural key (deviceId, day). Returns rows changed.
     @discardableResult
     public func upsertDailyMetrics(_ days: [DailyMetric], deviceId: String) async throws -> Int {

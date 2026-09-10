@@ -43,6 +43,46 @@ final class MetricsCacheTests: XCTestCase {
         XCTAssertNil(rows[0].stagesJSON)
     }
 
+    // MARK: - deleteSleepSessions(overlapping:) — makes recompute of the same night idempotent
+    //
+    // LocalMetricsEngine's detector finds a night's start/end FROM the data itself, so the exact
+    // startTs can shift a few minutes between two recomputes of the same still-unfolding night
+    // (see deleteSleepSessions' own doc comment). These tests pin the fix at the store layer:
+    // two windows for "the same night" with different startTs must collapse to one stored row.
+
+    func testDeleteSleepSessionsRemovesAnOverlappingRowWithADifferentStartTs() async throws {
+        let store = try await WhoopStore.inMemory()
+        // First computation of a night: 22:00–06:00 (arbitrary epoch units for readability).
+        let first = CachedSleepSession(startTs: 22_000, endTs: 30_000, efficiency: 0.9,
+                                       restingHr: 50, avgHrv: 60, stagesJSON: nil)
+        try await store.upsertSleepSessions([first], deviceId: "devA")
+
+        // Recompute a few minutes later: the run now starts 300s earlier and ends 4000s later —
+        // a DIFFERENT (deviceId, startTs), so a plain upsert would have created a second row.
+        try await store.deleteSleepSessions(deviceId: "devA", overlapping: [(21_700, 34_000)])
+        let second = CachedSleepSession(startTs: 21_700, endTs: 34_000, efficiency: 0.93,
+                                        restingHr: 48, avgHrv: 62, stagesJSON: nil)
+        try await store.upsertSleepSessions([second], deviceId: "devA")
+
+        let rows = try await store.sleepSessions(deviceId: "devA", from: 0, to: 100_000, limit: 100)
+        XCTAssertEqual(rows.count, 1, "recompute of the same night must replace, not duplicate")
+        XCTAssertEqual(rows[0], second)
+    }
+
+    func testDeleteSleepSessionsLeavesANonOverlappingNightAlone() async throws {
+        let store = try await WhoopStore.inMemory()
+        let nightOne = CachedSleepSession(startTs: 1_000, endTs: 20_000, efficiency: 0.9,
+                                          restingHr: 50, avgHrv: 60, stagesJSON: nil)
+        let nightTwo = CachedSleepSession(startTs: 100_000, endTs: 120_000, efficiency: 0.9,
+                                          restingHr: 52, avgHrv: 58, stagesJSON: nil)
+        try await store.upsertSleepSessions([nightOne, nightTwo], deviceId: "devA")
+
+        // Recomputing night one must not touch the unrelated, far-away night two.
+        try await store.deleteSleepSessions(deviceId: "devA", overlapping: [(900, 21_000)])
+        let rows = try await store.sleepSessions(deviceId: "devA", from: 0, to: 200_000, limit: 100)
+        XCTAssertEqual(rows.map { $0.startTs }, [100_000])
+    }
+
     func testSleepSessionRangeFilter() async throws {
         let store = try await WhoopStore.inMemory()
         try await store.upsertSleepSessions([
