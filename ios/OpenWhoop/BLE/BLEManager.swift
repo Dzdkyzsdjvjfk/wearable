@@ -692,11 +692,17 @@ extension BLEManager: CBCentralManagerDelegate {
         backfillTimer?.cancel()
         backfillTimer = nil
         if !intentionalDisconnect {
-            log("Disconnected\(error.map { " — \($0.localizedDescription)" } ?? ""); rescanning in 3s")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
-                guard let self, !self.intentionalDisconnect else { return }
-                self.connect()
-            }
+            log("Disconnected\(error.map { " — \($0.localizedDescription)" } ?? ""); rescanning now")
+            // IMMEDIATELY, not after a delay: this callback is itself the app's brief background
+            // execution window (granted because of the `bluetooth-central` background mode), and
+            // that window can close again in a few seconds. A delayed asyncAfter reconnect risks
+            // being scheduled to fire AFTER iOS has already suspended the app, in which case it
+            // never runs and nothing is left pending to wake the app again — the strap can then sit
+            // in range all night with the phone never reconnecting. A real overnight gap (2026-09-08
+            // 21:48 to 2026-09-09 06:39, nine hours, zero samples) traced back to exactly this.
+            // Calling connect() synchronously, right here, starts the scan while that window is
+            // still open, so CoreBluetooth has something pending to resume in the background.
+            connect()
         } else {
             log("Disconnected (intentional)")
         }

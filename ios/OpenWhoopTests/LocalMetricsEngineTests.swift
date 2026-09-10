@@ -131,6 +131,19 @@ final class LocalMetricsEngineTests: XCTestCase {
         XCTAssertNil(LocalMetricsEngine.restingHeartRate(hr: hr, from: 0, to: 10_000))
     }
 
+    /// A handful of 1 Hz samples (a thin stray batch, say) is enough to clear the OLD floor of 10
+    /// but not the current one of 60 — a percentile over a dozen readings can land on a dropout
+    /// run rather than the true resting floor, so this must stay nil rather than report a number.
+    func testRestingHeartRateRejectsAThinOneHzBurstEvenThoughItClearedTheOldFloor() {
+        let hr = hrSeries(start: 0, count: 55, stepSeconds: 1) { _ in 55 }
+        XCTAssertNil(LocalMetricsEngine.restingHeartRate(hr: hr, from: 0, to: 60))
+    }
+
+    func testRestingHeartRateAcceptsAtTheNewFloor() {
+        let hr = hrSeries(start: 0, count: 60, stepSeconds: 1) { _ in 55 }
+        XCTAssertEqual(LocalMetricsEngine.restingHeartRate(hr: hr, from: 0, to: 60), 55)
+    }
+
     // MARK: - HRV (RMSSD)
 
     func testRmssdIsZeroForPerfectlyRegularBeats() {

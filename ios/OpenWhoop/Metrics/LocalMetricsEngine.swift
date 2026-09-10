@@ -275,12 +275,21 @@ enum LocalMetricsEngine {
 
     // MARK: - Resting heart rate
 
+    /// Fewest in-window samples before a resting-HR reading is trusted. 60 is a deliberately
+    /// higher floor than a bare sanity check (10, the old value) would give: a 5th percentile of
+    /// only a dozen readings can land on a dropout run rather than the true resting floor, and
+    /// with the strap's live stream normally landing ~1 sample/second, 60 costs nothing on a real
+    /// night (that is one minute of the several hours a night actually covers) while it does
+    /// reject the genuinely thin windows — a stray few minutes of historical data, say — that
+    /// used to produce a number confident enough to display but too small a sample to mean much.
+    static let minRestingHrSamples = 60
+
     /// Robust low heart rate across a window: the 5th percentile, which tracks the true resting
     /// floor without being hostage to a single dropout sample the way min() would be.
     static func restingHeartRate(hr: [HRSample], from: Int, to: Int) -> Int? {
         let inWindow = hr.filter { $0.ts >= from && $0.ts <= to && $0.bpm > 25 && $0.bpm < 220 }
             .map { Double($0.bpm) }
-        guard inWindow.count >= 10, let p = percentile(inWindow, 0.05) else { return nil }
+        guard inWindow.count >= minRestingHrSamples, let p = percentile(inWindow, 0.05) else { return nil }
         return Int(p.rounded())
     }
 
